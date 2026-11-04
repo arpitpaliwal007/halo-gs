@@ -1,0 +1,12 @@
+# HaloGS python deps (gaussian-splatting + its CUDA submodules are installed by setup_gs.sh)
+torch>=2.0
+numpy
+pillow
+plyfile
+tqdm
+scikit-image
+lpips
+huggingface_hub   # data/download_bilarf.sh
+rawpy             # RawNeRF DNG development (optional)
+gdown             # LLNeRF (optional)
+pytest

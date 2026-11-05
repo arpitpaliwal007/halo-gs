@@ -12,3 +12,6 @@ out_abl/
 *.npy
 .ipynb_checkpoints/
 gaussian-splatting/
+LITA-GS/
+data/lita/
+out_lita/

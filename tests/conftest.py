@@ -26,6 +26,33 @@ def _stub_cuda_modules():
         sys.modules["diff_gaussian_rasterization"] = dgr
 
 
+def _stub_optional_modules():
+    """LITA-GS's dataset_readers imports open3d at module level; stub it when absent."""
+    for name in ("open3d",):
+        if name not in sys.modules:
+            try:
+                __import__(name)
+            except Exception:
+                sys.modules[name] = types.ModuleType(name)
+
+
+@pytest.fixture(scope="session")
+def lita_root():
+    from halogs.gs_path import find_lita_root
+    try:
+        root = find_lita_root(os.environ.get("LITA_ROOT"))
+    except FileNotFoundError:
+        pytest.skip("LITA-GS checkout not found (set LITA_ROOT)")
+    for m in ("scene", "gaussian_renderer", "arguments", "utils"):
+        if m in sys.modules:
+            pytest.skip("another gaussian-splatting backend is already imported in this process")
+    _stub_cuda_modules()
+    _stub_optional_modules()
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    return root
+
+
 @pytest.fixture(scope="session")
 def gs_root():
     from halogs.gs_path import find_gs_root

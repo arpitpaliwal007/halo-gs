@@ -31,7 +31,8 @@ learns it from generated videos; the 2D APSF literature has the physics but no
 ```
 halogs/        apsf.py (kernels) · compositing.py (FFT conv) · gaussians.py (emission lifecycle)
                halo.py (two-pass render) · losses.py · masks.py · metrics.py · splits.py
-train_glow.py  ours (--mode halo) and baselines (--mode vanilla | masked), same split/schedule
+train_glow.py  vanilla-3DGS backbone: ours (--mode halo) and baselines (--mode vanilla | masked)
+train_lita_halo.py  LITA-GS backbone: ours (--mode halo) and plain LITA-GS (--mode lita)
 render_glow.py composite / scene / glow / emission layers + evaluation manifest
 eval_glow.py   full, in-glow and out-of-glow PSNR / SSIM / LPIPS, paired by image name
 data/          download + prepare real glow scenes (Bilarf, RawNeRF, LLNeRF); synthetic control
@@ -83,6 +84,42 @@ out/<scene>/<method>/
   renders/iteration_N/test/{render,scene,glow,emission,gt}/<name>.png + manifest.json
   renders/iteration_N/test/{metrics.json, per_view.csv}
 ```
+
+## LITA-GS backbone (recommended for dark scenes with lamps)
+
+The official [LITA-GS](https://github.com/LowLevelAI/LITA-GS) (CVPR 2025, built on
+Gaussian-DK) is a much stronger illumination model than plain 3DGS: 3-channel
+per-Gaussian illumination, a learned tone-mapper, a denoiser, Marigold depth
+and CIConv structure priors. `train_lita_halo.py` plugs HaloGS's emission +
+scatter kernel into it with no CUDA rebuild (the emission is rasterised in a
+second pass through LITA-GS's own 11-channel rasteriser):
+
+```
+low_v    = tonemapper( illu_v * denoise(scene_v) )  +  k * E_v
+bright_v = scene_v                                  +  s_v * (k * E_v)      s_v = theta / mean(low_v)
+```
+
+`scene_v` stays glow-free; `--mode lita` runs plain LITA-GS through the same
+script, so the baseline shares split, schedule and initialisation.
+
+```bash
+bash setup_lita.sh ../LITA-GS && export LITA_ROOT=$PWD/../LITA-GS
+python data/prepare_lita_scene.py --scene data/scenes/bilarf/pondbike --out data/lita/pondbike --prior
+bash scripts/run_scene_lita.sh data/lita/pondbike out_lita/pondbike 20000 --no_depth --split every8
+# official LOM protocol (eval_index [0,4,10], theta = 0.49, 20k iterations), needs their LOM zip with depth_maps/ + W_0.8/
+python train_lita_halo.py -s data/LOM_low_buu_colmap -m out_lita/buu/halo --mode halo --split lita --configs $LITA_ROOT/arguments/LOM/buu_low.py
+```
+
+Three held-out numbers are logged per view: `lita_*` (their protocol: glow-free
+denoised bright render vs `images/`), `bright_*` (bright render + scaled glow
+vs `images/`, the fair one when the reference contains halos) and `low_*`
+(tone-mapped composite vs the observed dark photo, with glow-region split).
+Note LITA-GS's own script selects the checkpoint with the best *test* PSNR
+every 100 iterations; this script does not (fixed iteration count), so numbers
+will be slightly lower than theirs and comparable across methods.
+
+Backends cannot be mixed in one process (both define `scene`, `gaussian_renderer`,
+`arguments`, `utils`); `scripts/run_tests.sh` runs each test group separately.
 
 ## Evaluation protocol
 

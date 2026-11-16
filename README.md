@@ -121,6 +121,49 @@ will be slightly lower than theirs and comparable across methods.
 Backends cannot be mixed in one process (both define `scene`, `gaussian_renderer`,
 `arguments`, `utils`); `scripts/run_tests.sh` runs each test group separately.
 
+## LitaLite backbone (corrected) and LitaLite + HaloGS
+
+LitaLite is the earlier reference-free low-light model (the "Direct Method"): per-Gaussian
+reflectance (SH colour) and a scalar illumination, a bright render `R = G(c)` pulled toward a
+linearly brightened input, and a dark render `G(c * L)` tied to the captured photo.
+It runs on the vanilla 3DGS backend (`setup_gs.sh`), so it is much faster than LITA-GS.
+
+Corrections relative to the original `litalite.py` (see `implementation_audit_2026-10-02.md`):
+
+| Issue in the original | Fix here |
+|---|---|
+| illumination in a side tensor, truncated / mean-padded by *count* on prune and densify | per-Gaussian optimiser group; follows identity through prune / clone / split, keeps Adam moments (`tests/test_illum_lifecycle.py`) |
+| densification statistics from the bright branch only | from both branches (`--dense_from both`, default; `bright` = original) |
+| target clipped per channel, which changes hue where it saturates | hue-safe target: saturating pixels scaled as a whole (`--legacy_clip` = original) |
+| per-image gain only | `--target_gain image` (original) or `scene` (one gain for all views) |
+| evaluation paired renders and references by directory order | references matched by image name (`--clean_gt_dir`), never by order |
+
+`--mode litalite_halo` adds HaloGS: the dark render becomes `clip(G(c * L) + k * E)`, so lamps and
+their halos are explained by emission + scattering kernel instead of being baked into reflectance.
+
+```bash
+# LOM buu: dark images in images/, normal-light references in gt/
+python train_glow.py -s datasets/buu -m out/buu/litalite --mode litalite \
+    --iterations 15000 --save_iterations 7000 15000 \
+    --densify_until_iter 5000 --densification_interval 100 --opacity_reset_interval 3000 \
+    --clean_gt_dir datasets/buu/gt
+python render_glow.py -m out/buu/litalite --iteration 15000 --skip_train
+python eval_glow.py   -m out/buu/litalite --iteration 15000 --clean_gt_dir datasets/buu/gt
+# same with glow (night scenes with lamps):  --mode litalite_halo
+# original behaviour for an ablation:         --dense_from bright --legacy_clip
+```
+
+Three cheap upgrades toward LITA-GS (each a flag, so each can be ablated):
+
+| Flag | What it adds |
+|---|---|
+| `--illum_channels 3` | RGB illumination per Gaussian, so coloured light is not pushed into reflectance |
+| `--tone_curve` | learned per-view response `g_v * x^gamma_v` on the dark branch (identity at start; test views use the mean) |
+| `--denoise_target bilateral` | edge-preserving filter on the brightened target, where the gain amplifies sensor noise |
+
+`test_curve.jsonl` then holds both the dark-composite score against the observed photo
+(`psnr`) and the bright output against the normal-light reference (`clean_psnr`).
+
 ## Evaluation protocol
 
 Real scenes have no glow-free reference, so held-out views are scored

@@ -9,6 +9,7 @@ Writes <model_path>/renders/iteration_N/{test,train}/
     glow/<name>.png       glow layer (x4 for visibility; raw .npy also saved when --save_npy)
     emission/<name>.png   rendered emission map
     gt/<name>.png         observed reference
+    bright/<name>.png     litalite modes only: the enhanced (reflectance) output
     manifest.json         render <-> camera <-> reference pairing (by image name)
 """
 from __future__ import annotations
@@ -37,6 +38,7 @@ from utils.general_utils import safe_state  # noqa: E402
 
 from halogs.gaussians import EmissiveGaussianModel  # noqa: E402
 from halogs.halo import HaloModel, render_halo  # noqa: E402
+from halogs.litalite import render_litalite  # noqa: E402
 from halogs.splits import load_split  # noqa: E402
 
 
@@ -47,12 +49,19 @@ def to_png(t: torch.Tensor, path: str, scale: float = 1.0) -> None:
 
 @torch.no_grad()
 def render_set(out_dir, cams, gaussians, pipe, bg, halo, mode, save_npy):
-    for sub in ("render", "scene", "glow", "emission", "gt"):
+    lit = mode.startswith("litalite")
+    subs = ("render", "scene", "glow", "emission", "gt") + (("bright",) if lit else ())
+    for sub in subs:
         os.makedirs(os.path.join(out_dir, sub), exist_ok=True)
     manifest = []
     for cam in cams:
-        pkg = render_halo(render, cam, gaussians, pipe, bg, halo, mode=mode)
+        if lit:
+            pkg = render_litalite(render, cam, gaussians, pipe, bg, halo, use_glow=halo is not None)
+        else:
+            pkg = render_halo(render, cam, gaussians, pipe, bg, halo, mode=mode)
         name = cam.image_name
+        if lit:
+            to_png(pkg["bright"], os.path.join(out_dir, "bright", f"{name}.png"))
         to_png(pkg["render"], os.path.join(out_dir, "render", f"{name}.png"))
         to_png(pkg["scene"], os.path.join(out_dir, "scene", f"{name}.png"))
         to_png(pkg["glow"], os.path.join(out_dir, "glow", f"{name}.png"), scale=4.0)
@@ -62,7 +71,8 @@ def render_set(out_dir, cams, gaussians, pipe, bg, halo, mode, save_npy):
             np.save(os.path.join(out_dir, "glow", f"{name}.npy"), pkg["glow"].cpu().numpy())
         manifest.append({"image_name": name, "colmap_id": int(getattr(cam, "colmap_id", -1)),
                          "render": f"render/{name}.png", "gt": f"gt/{name}.png",
-                         "scene": f"scene/{name}.png", "glow": f"glow/{name}.png"})
+                         "scene": f"scene/{name}.png", "glow": f"glow/{name}.png",
+                         **({"bright": f"bright/{name}.png"} if lit else {})})
     with open(os.path.join(out_dir, "manifest.json"), "w") as f:
         json.dump(manifest, f, indent=2)
     names = [m["image_name"] for m in manifest]
@@ -88,13 +98,13 @@ def main():
         cfg = json.load(f)
     mode = cfg.get("mode", "halo")
 
-    gaussians = EmissiveGaussianModel(dataset.sh_degree)
+    gaussians = EmissiveGaussianModel(dataset.sh_degree, with_illum=mode.startswith("litalite"))
     scene = Scene(dataset, gaussians, load_iteration=args.iteration, shuffle=False)
     it = scene.loaded_iter
     pc_dir = os.path.join(dataset.model_path, "point_cloud", f"iteration_{it}")
 
     halo = None
-    if mode == "halo":
+    if mode in ("halo", "litalite_halo"):
         halo = HaloModel.load(os.path.join(pc_dir, "halo.pt"), device="cuda")
         print("[halogs] kernel:", halo.kernel.describe())
 

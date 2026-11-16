@@ -59,7 +59,7 @@ def render_lita_halo(viewpoint_camera, pc, pipe, bg_color, halo, scale_s: float,
                     "bright_composite": scene, "denoised_composite": pkg["denoised_list"][-1]})
         return pkg
     E = render_emission(viewpoint_camera, pc, pipe, bg_color, depth_threshold, iteration)
-    glow = fft_conv2d(E, halo.kernel.kernel())
+    glow = E if halo.kernel_kind == "identity" else fft_conv2d(E, halo.kernel.kernel())
     pkg["emission"] = E
     pkg["glow"] = glow
     pkg["low_composite"] = (pkg["render_low"] + glow).clamp(0, 1)

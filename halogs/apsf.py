@@ -106,9 +106,11 @@ class GlowKernel(nn.Module):
 
     def __init__(self, radius: int = 96, focal_px: float = 600.0, components: str = "both",
                  q_init: float = 0.9, T_init: float = 1.5, gamma_init: float = 6.0,
-                 w_init: float = 0.5, p: float = 3.0, n_terms: int = 24, learn: bool = True):
+                 w_init: float = 0.5, p: float = 3.0, n_terms: int = 24, learn: bool = True,
+                 gamma_min: float = 0.3):
         super().__init__()
         assert components in ("both", "apsf", "lens")
+        self.gamma_min = float(gamma_min)  # px; raise (e.g. 3) to stop the lens term collapsing to a delta
         self.radius = int(radius)
         self.components = components
         self.focal_px = float(focal_px)
@@ -116,7 +118,7 @@ class GlowKernel(nn.Module):
         self.p = float(p)
         self.q_logit = nn.Parameter(torch.tensor(_logit(q_init)), requires_grad=learn)
         self.T_raw = nn.Parameter(torch.tensor(_inv_softplus(T_init - T_MIN)), requires_grad=learn)
-        self.gamma_raw = nn.Parameter(torch.tensor(_inv_softplus(gamma_init)), requires_grad=learn)
+        self.gamma_raw = nn.Parameter(torch.tensor(_inv_softplus(max(gamma_init - gamma_min, 1e-3))), requires_grad=learn)
         self.w_logit = nn.Parameter(torch.tensor(_logit(w_init)), requires_grad=learn and components == "both")
         self.register_buffer("_r", radial_grid(self.radius))
 
@@ -131,7 +133,7 @@ class GlowKernel(nn.Module):
 
     @property
     def gamma(self) -> torch.Tensor:
-        return F.softplus(self.gamma_raw) + 0.3
+        return F.softplus(self.gamma_raw) + self.gamma_min
 
     @property
     def w(self) -> torch.Tensor:
@@ -169,7 +171,22 @@ class GlowKernel(nn.Module):
         with torch.no_grad():
             return {"type": "glow", "components": self.components, "radius": self.radius,
                     "focal_px": self.focal_px, "q": self.q.item(), "T": self.T.item(),
-                    "gamma_px": self.gamma.item(), "w_lens": self.w.item(), "p": self.p}
+                    "gamma_px": self.gamma.item(), "gamma_min": self.gamma_min, "w_lens": self.w.item(), "p": self.p}
+
+
+class IdentityKernel(nn.Module):
+    """Exact unit impulse for an additive-emission control."""
+
+    def __init__(self):
+        super().__init__()
+        self.radius = 0
+        self.register_buffer("_unit", torch.ones((1, 1)))
+
+    def kernel(self) -> torch.Tensor:
+        return self._unit
+
+    def describe(self) -> dict:
+        return {"type": "identity", "radius": self.radius}
 
 
 class RadialKernel(nn.Module):
@@ -216,8 +233,10 @@ class RadialKernel(nn.Module):
 
 def make_kernel(kind: str, radius: int, focal_px: float, **kw) -> nn.Module:
     """kind: 'both' | 'apsf' | 'lens' | 'radial'."""
+    if kind == "identity":
+        return IdentityKernel()
     if kind in ("both", "apsf", "lens"):
-        return GlowKernel(radius=radius, focal_px=focal_px, components=kind, **kw)
+        return GlowKernel(radius=radius, focal_px=focal_px, components=kind, **kw)  # kw may include gamma_min, gamma_init, w_init
     if kind == "radial":
         return RadialKernel(radius=radius, **{k: v for k, v in kw.items() if k in ("n_knots", "learn")})
     raise ValueError(f"unknown kernel kind {kind!r}")

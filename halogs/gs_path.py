@@ -44,15 +44,20 @@ def find_lita_root(explicit: str | None = None) -> str:
     return r
 
 
-def _check_clash():
+def _check_clash(root: str):
+    """Refuse to mix backends; re-adding the *same* backend (a second script import) is fine."""
     for m in ("scene", "gaussian_renderer", "arguments"):
-        if m in sys.modules:
+        mod = sys.modules.get(m)
+        if mod is None:
+            continue
+        f = getattr(mod, "__file__", None) or ""
+        if not os.path.abspath(f).startswith(root + os.sep):
             raise RuntimeError(f"module '{m}' already imported from another backend; use one backend per process")
 
 
 def add_gs_to_path(explicit: str | None = None) -> str:
     root = find_gs_root(explicit)
-    _check_clash()
+    _check_clash(root)
     if root not in sys.path:
         sys.path.insert(0, root)
     return root
@@ -60,7 +65,7 @@ def add_gs_to_path(explicit: str | None = None) -> str:
 
 def add_lita_to_path(explicit: str | None = None) -> str:
     root = find_lita_root(explicit)
-    _check_clash()
+    _check_clash(root)
     if root not in sys.path:
         sys.path.insert(0, root)
     return root

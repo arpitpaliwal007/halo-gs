@@ -43,6 +43,7 @@ from utils.general_utils import safe_state  # noqa: E402
 
 from halogs.gaussians import EmissiveGaussianModel  # noqa: E402
 from halogs.halo import HaloModel, focal_px_from_camera, render_halo  # noqa: E402
+from halogs.litalite import ToneCurve, bilateral, brighten_target, illum_init_from, render_litalite, scene_gain  # noqa: E402
 from halogs.losses import emission_sparsity, glow_tv, photometric_loss  # noqa: E402
 from halogs.masks import glow_mask  # noqa: E402
 from halogs.metrics import all_metrics  # noqa: E402
@@ -57,10 +58,14 @@ def _nanmean(xs):
 def add_halo_args(p: argparse.ArgumentParser) -> None:
     g = p.add_argument_group("halo")
     g.add_argument("--gs_root", type=str, default=None, help="path to gaussian-splatting checkout")
-    g.add_argument("--mode", choices=["halo", "vanilla", "masked"], default="halo")
+    g.add_argument("--mode", choices=["halo", "vanilla", "masked", "litalite", "litalite_halo"], default="halo",
+                   help="litalite = corrected reference-free low-light model; litalite_halo = litalite + emission/glow")
     g.add_argument("--kernel", choices=["both", "apsf", "lens", "radial"], default="both")
     g.add_argument("--kernel_radius", type=int, default=-1, help="px; -1 = 0.1*max(H,W) clamped to [32,160]")
     g.add_argument("--freeze_kernel", action="store_true")
+    g.add_argument("--gamma_min", type=float, default=0.3, help="px floor for the lens glare width; 0.3 lets it collapse to a delta, 3 forces a real halo")
+    g.add_argument("--gamma_init", type=float, default=6.0)
+    g.add_argument("--w_init", type=float, default=0.5, help="initial lens/APSF mixture weight")
     g.add_argument("--kernel_lr", type=float, default=2e-3)
     g.add_argument("--emission_lr", type=float, default=0.01)
     g.add_argument("--lambda_emission", type=float, default=0.01, help="L1 sparsity on per-Gaussian emission")
@@ -78,6 +83,33 @@ def add_halo_args(p: argparse.ArgumentParser) -> None:
     g.add_argument("--save_iterations", nargs="+", type=int, default=[7000, 30000])
     g.add_argument("--quiet", action="store_true")
     g.add_argument("--tag", type=str, default="", help="free-form label written to config.json")
+    g = p.add_argument_group("litalite")
+    g.add_argument("--theta", type=float, default=0.40, help="target mean brightness of the brightened pseudo-target")
+    g.add_argument("--target_gain", choices=["image", "scene"], default="image",
+                   help="image = theta/mean(this image) (original); scene = one gain for all views")
+    g.add_argument("--legacy_clip", action="store_true", help="clip target channels independently (original, not hue-safe)")
+    g.add_argument("--dense_from", choices=["both", "bright"], default="both",
+                   help="densification statistics from both branches (fix) or the bright one only (original)")
+    g.add_argument("--illum_lr", type=float, default=0.01)
+    g.add_argument("--w_exp", type=float, default=1.0)
+    g.add_argument("--w_rec", type=float, default=1.0)
+    g.add_argument("--w_tv", type=float, default=0.01, help="TV on the bright render (as in litalite.py)")
+    g.add_argument("--clean_gt_dir", type=str, default=None,
+                   help="normal-light references (e.g. LOM high/), matched by image name; scores the bright render")
+    g.add_argument("--illum_channels", type=int, choices=[1, 3], default=1,
+                   help="1 = grey illumination (original); 3 = RGB illumination (coloured light)")
+    g.add_argument("--tone_curve", action="store_true", help="learn a per-view response curve g*x^gamma on the dark branch")
+    g.add_argument("--tone_lr", type=float, default=1e-3)
+    g.add_argument("--denoise_target", choices=["none", "bilateral", "n2n_unet"], default="none",
+                   help="edge-preserving filter on the brightened target (the dark loss keeps the raw photo)")
+    g.add_argument("--dn_radius", type=int, default=2)
+    g.add_argument("--dn_sigma_s", type=float, default=1.5)
+    g.add_argument("--dn_sigma_r", type=float, default=0.08)
+    g.add_argument("--n2n_iters", type=int, default=2000, help="U-Net Neighbor2Neighbor training steps")
+    g.add_argument("--n2n_crop", type=int, default=128)
+    g.add_argument("--n2n_batch", type=int, default=4)
+    g.add_argument("--n2n_width", type=int, default=32, help="U-Net base channels (32 -> ~3.7 M params)")
+    g.add_argument("--n2n_lr", type=float, default=1e-3)
 
 
 def set_seed(seed: int) -> None:
@@ -108,7 +140,10 @@ def main():
         f.write(str(argparse.Namespace(**vars(args))))
     device = "cuda"
 
-    gaussians = EmissiveGaussianModel(dataset.sh_degree, emission_lr=args.emission_lr)
+    lit = args.mode.startswith("litalite")
+    glow_mode = args.mode in ("halo", "litalite_halo")
+    gaussians = EmissiveGaussianModel(dataset.sh_degree, emission_lr=args.emission_lr,
+                                      with_illum=lit, illum_lr=args.illum_lr, illum_channels=args.illum_channels)
     scene = Scene(dataset, gaussians)
 
     # ---- explicit split written to disk --------------------------------------------
@@ -119,6 +154,50 @@ def main():
     save_split(os.path.join(dataset.model_path, "split.json"), train_cams, test_cams, args.split)
     print(f"[halogs] {len(train_cams)} train / {len(test_cams)} test views ({args.split})")
 
+    target_gain = None
+    if lit:
+        p0 = illum_init_from(train_cams, args.theta)
+        gaussians.set_illum_init(p0)
+        if args.target_gain == "scene":
+            target_gain = scene_gain(train_cams, args.theta)
+        print(f"[litalite] theta={args.theta} illumination init {p0:.4f} target gain "
+              f"{'per image' if target_gain is None else f'{target_gain:.3f} (scene)'}  "
+              f"hue-safe={not args.legacy_clip} dense_from={args.dense_from}")
+    clean_refs = load_clean_refs(args.clean_gt_dir) if args.clean_gt_dir else None
+    tone = tone_opt = None
+    if lit and args.tone_curve:
+        tone = ToneCurve([c.image_name for c in train_cams]).to(device)
+        tone_opt = torch.optim.Adam(tone.parameters(), lr=args.tone_lr)
+    target_cache = {}
+    n2n_net, n2n_s = None, 1.0
+    if lit and args.denoise_target == "n2n_unet":
+        from halogs.denoise_n2n import apply as n2n_apply, count_params, n2n_scale, train_n2n
+        dark = [c.original_image.to(device) for c in train_cams]  # training views only
+        n2n_s = n2n_scale(dark)
+        t_n2n = time.time()
+        n2n_net = train_n2n([(d * n2n_s).clamp(0, 1) for d in dark], iters=args.n2n_iters, crop=args.n2n_crop,
+                            batch=args.n2n_batch, width=args.n2n_width, lr=args.n2n_lr, device=device, seed=args.seed,
+                            log_every=0 if args.quiet else 250)
+        torch.save(n2n_net.state_dict(), os.path.join(dataset.model_path, "n2n_unet.pt"))
+        print(f"[litalite] U-Net denoiser ({count_params(n2n_net) / 1e6:.2f} M params) trained on "
+              f"{len(dark)} training images in {(time.time() - t_n2n) / 60:.1f} min (scale {n2n_s:.2f})")
+        del dark
+
+    def lit_target(cam, gt):
+        if cam.image_name not in target_cache:
+            src = gt
+            if n2n_net is not None:  # denoise the dark photo at a mid-grey scale, then brighten as usual
+                src = (n2n_apply(n2n_net, (gt * n2n_s).clamp(0, 1)) / n2n_s).clamp(0, 1)
+            t = brighten_target(src, args.theta, target_gain, hue_safe=not args.legacy_clip)
+            if args.denoise_target == "bilateral":
+                with torch.no_grad():
+                    t = bilateral(t, args.dn_radius, args.dn_sigma_s, args.dn_sigma_r)
+            target_cache[cam.image_name] = t.detach()
+        return target_cache[cam.image_name]
+    if lit:
+        print(f"[litalite] illumination channels={args.illum_channels} tone_curve={bool(tone)} "
+              f"denoise_target={args.denoise_target}")
+
     gaussians.training_setup(opt)
 
     # ---- glow model ------------------------------------------------------------------
@@ -128,11 +207,12 @@ def main():
     focal = focal_px_from_camera(cam0)
     halo = None
     halo_opt = None
-    if args.mode == "halo":
+    if glow_mode:
         halo = HaloModel(kernel_kind=args.kernel, radius=radius, focal_px=focal,
                          per_view_exposure=args.per_view_exposure,
                          train_names=[c.image_name for c in train_cams],
-                         learn_kernel=not args.freeze_kernel).to(device)
+                         learn_kernel=not args.freeze_kernel,
+                         gamma_min=args.gamma_min, gamma_init=args.gamma_init, w_init=args.w_init).to(device)
         groups = halo.param_groups(args.kernel_lr, args.exposure_lr)
         halo_opt = torch.optim.Adam(groups, lr=0.0) if groups else None
         print(f"[halogs] kernel={args.kernel} radius={radius}px focal={focal:.1f}px  H={H} W={W}")
@@ -159,7 +239,8 @@ def main():
     log_f = open(log_path, "w", newline="")
     log = csv.writer(log_f)
     log.writerow(["iter", "loss", "l1", "n_gaussians", "emission_mean", "emission_max", "frac_emitters",
-                  "q", "T", "gamma_px", "w_lens", "gain_mean", "peak_mem_gb", "sec_per_iter"])
+                  "q", "T", "gamma_px", "w_lens", "gain_mean", "peak_mem_gb", "sec_per_iter",
+                  "l_exp", "l_rec", "illum_mean", "tone"])
 
     viewpoint_stack = None
     ema_loss = 0.0
@@ -174,12 +255,20 @@ def main():
             viewpoint_stack = train_cams.copy()
         cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack) - 1))
 
-        use_glow = args.mode == "halo" and iteration > args.glow_from_iter
-        pkg = render_halo(render, cam, gaussians, pipe, bg, halo, mode="halo" if use_glow else "vanilla")
-        image = pkg["render"]
+        use_glow = glow_mode and iteration > args.glow_from_iter
         gt = cam.original_image.to(device)
-
-        loss, l1 = photometric_loss(image, gt, opt.lambda_dssim, valid_mask(cam))
+        l_exp = l_rec = None
+        if lit:
+            pkg = render_litalite(render, cam, gaussians, pipe, bg, halo, use_glow=use_glow, tone=tone)
+            target = lit_target(cam, gt)
+            l_exp, _ = photometric_loss(pkg["bright"], target, opt.lambda_dssim)
+            l_rec, l1 = photometric_loss(pkg["render"], gt, opt.lambda_dssim)
+            loss = args.w_exp * l_exp + args.w_rec * l_rec
+            if args.w_tv > 0:
+                loss = loss + args.w_tv * glow_tv(pkg["bright"])
+        else:
+            pkg = render_halo(render, cam, gaussians, pipe, bg, halo, mode="halo" if use_glow else "vanilla")
+            loss, l1 = photometric_loss(pkg["render"], gt, opt.lambda_dssim, valid_mask(cam))
         if use_glow:
             if args.lambda_emission > 0:
                 loss = loss + args.lambda_emission * emission_sparsity(gaussians.get_emission)
@@ -193,10 +282,16 @@ def main():
                 print(f"\r[{iteration}/{opt.iterations}] loss {ema_loss:.5f} N={gaussians.get_xyz.shape[0]}", end="")
 
             # densification (scene-pass statistics, as in the official code)
-            vis, radii, vsp = pkg["visibility_filter"], pkg["radii"], pkg["viewspace_points"]
+            radii = pkg["radii"]
             if iteration < opt.densify_until_iter:
-                gaussians.max_radii2D[vis] = torch.max(gaussians.max_radii2D[vis], radii[vis])
-                gaussians.add_densification_stats(vsp, vis)
+                branches = pkg.get("dense", [(pkg["viewspace_points"], pkg["visibility_filter"], pkg["radii"])])
+                if args.dense_from == "bright":
+                    branches = branches[:1]
+                for vsp, vis, r in branches:
+                    gaussians.max_radii2D[vis] = torch.max(gaussians.max_radii2D[vis], r[vis])
+                    gaussians.add_densification_stats(vsp, vis)
+                if len(branches) > 1:
+                    radii = torch.max(branches[0][2], branches[1][2])
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
                     gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii)
@@ -209,6 +304,9 @@ def main():
                 if halo_opt is not None:
                     halo_opt.step()
                     halo_opt.zero_grad(set_to_none=True)
+                if tone_opt is not None:
+                    tone_opt.step()
+                    tone_opt.zero_grad(set_to_none=True)
 
             # logging
             if iteration % args.log_every == 0 or iteration == opt.iterations:
@@ -220,13 +318,17 @@ def main():
                 log.writerow([iteration, f"{ema_loss:.6f}", f"{l1.item():.6f}", es["n_gaussians"],
                               f"{es['emission_mean']:.5f}", f"{es['emission_max']:.4f}", f"{es['frac_emitters_gt_0.1']:.4f}",
                               kd.get("q", ""), kd.get("T", ""), kd.get("gamma_px", ""), kd.get("w_lens", ""),
-                              hd.get("gain_mean", ""), f"{peak:.3f}", f"{(now - last_t) / args.log_every:.4f}"])
+                              hd.get("gain_mean", ""), f"{peak:.3f}", f"{(now - last_t) / args.log_every:.4f}",
+                              f"{l_exp.item():.6f}" if l_exp is not None else "",
+                              f"{l_rec.item():.6f}" if l_rec is not None else "",
+                              f"{gaussians.get_illum.mean().item():.4f}" if lit else "",
+                              json.dumps(tone.describe()) if tone is not None else ""])
                 log_f.flush()
                 last_t = now
 
             # held-out evaluation (composite vs observed reference)
             if iteration % args.test_every == 0 or iteration == opt.iterations:
-                evaluate(iteration, test_cams, gaussians, pipe, bg, halo, args, dataset.model_path, use_glow or args.mode != "halo")
+                evaluate(iteration, test_cams, gaussians, pipe, bg, halo, args, dataset.model_path, use_glow, clean_refs, tone)
 
             if iteration in args.save_iterations or iteration == opt.iterations:
                 print(f"\n[ITER {iteration}] saving")
@@ -235,27 +337,64 @@ def main():
                 gaussians.save_emission(os.path.join(pc_dir, "emission.pt"))
                 if halo is not None:
                     halo.save(os.path.join(pc_dir, "halo.pt"))
+                if tone is not None:
+                    tone.save(os.path.join(pc_dir, "tone.pt"))
 
     log_f.close()
     print(f"\n[halogs] done in {(time.time() - t0) / 60:.1f} min -> {dataset.model_path}")
 
 
+def load_clean_refs(d: str) -> dict:
+    """image stem -> path of a normal-light reference (pairing by name, never by order)."""
+    exts = (".png", ".jpg", ".jpeg", ".JPG", ".PNG")
+    refs = {os.path.splitext(n)[0]: os.path.join(d, n) for n in sorted(os.listdir(d)) if n.endswith(exts)}
+    print(f"[halogs] {len(refs)} clean references in {d}")
+    return refs
+
+
+def _load_ref(path, like):
+    from PIL import Image
+    a = np.asarray(Image.open(path).convert("RGB"), dtype=np.float32) / 255.0
+    t = torch.from_numpy(a).permute(2, 0, 1).to(like.device)
+    if t.shape != like.shape:
+        t = torch.nn.functional.interpolate(t[None], size=like.shape[1:], mode="area")[0]
+    return t
+
+
 @torch.no_grad()
-def evaluate(iteration, test_cams, gaussians, pipe, bg, halo, args, model_path, glow_on):
+def evaluate(iteration, test_cams, gaussians, pipe, bg, halo, args, model_path, glow_on, clean_refs=None, tone=None):
     if not test_cams:
         return
-    rows = []
+    lit = args.mode.startswith("litalite")
+    rows, crow = [], []
     for cam in test_cams:
-        pkg = render_halo(render, cam, gaussians, pipe, bg, halo, mode="halo" if (glow_on and args.mode == "halo") else "vanilla")
+        if lit:
+            pkg = render_litalite(render, cam, gaussians, pipe, bg, halo, use_glow=glow_on, tone=tone)
+        else:
+            pkg = render_halo(render, cam, gaussians, pipe, bg, halo, mode="halo" if glow_on else "vanilla")
         gt = cam.original_image.to(pkg["render"].device)
         gm = glow_mask(gt, args.mask_thresh, args.mask_radius)
         m = all_metrics(pkg["render"].clamp(0, 1), gt, gm, with_lpips=False)
         m["view"] = cam.image_name
         rows.append(m)
+        if clean_refs is not None:
+            out = pkg["bright"] if lit else pkg["scene"]
+            stem = os.path.splitext(cam.image_name)[0]
+            if stem in clean_refs:
+                c = all_metrics(out.clamp(0, 1), _load_ref(clean_refs[stem], out), gm, with_lpips=False)
+                crow.append(c)
     keys = [k for k in rows[0] if k != "view"]
     mean = {k: float(_nanmean([r[k] for r in rows])) for k in keys}
     print(f"\n[ITER {iteration}] test  PSNR {mean['psnr']:.2f}  SSIM {mean['ssim']:.3f}  "
           f"| glow PSNR {mean['psnr_glow']:.2f}  non-glow PSNR {mean['psnr_nonglow']:.2f}  (glow frac {mean['glow_frac']:.3f})")
+    if crow:
+        cm = {f"clean_{k}": float(_nanmean([r[k] for r in crow])) for k in crow[0]}
+        cm["clean_n"] = len(crow)
+        mean.update(cm)
+        print(f"[ITER {iteration}] {'bright' if lit else 'scene'} vs clean reference  "
+              f"PSNR {cm['clean_psnr']:.2f}  SSIM {cm['clean_ssim']:.3f}  (n={len(crow)})")
+    elif clean_refs is not None:
+        print(f"[ITER {iteration}] WARNING: no clean reference matched any test view name")
     with open(os.path.join(model_path, "test_curve.jsonl"), "a") as f:
         f.write(json.dumps({"iter": iteration, **mean}) + "\n")
 

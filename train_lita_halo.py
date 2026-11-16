@@ -64,9 +64,12 @@ def add_halo_args(p):
     g = p.add_argument_group("halo")
     g.add_argument("--lita_root", type=str, default=None)
     g.add_argument("--mode", choices=["halo", "lita"], default="halo", help="halo = LITA-GS + emission/glow; lita = plain LITA-GS")
-    g.add_argument("--kernel", choices=["both", "apsf", "lens", "radial"], default="both")
+    g.add_argument("--kernel", choices=["both", "apsf", "lens", "radial", "identity"], default="both")
     g.add_argument("--kernel_radius", type=int, default=-1)
     g.add_argument("--freeze_kernel", action="store_true")
+    g.add_argument("--gamma_min", type=float, default=0.3, help="px floor for the lens glare width; 0.3 lets it collapse to a delta, 3 forces a real halo")
+    g.add_argument("--gamma_init", type=float, default=6.0)
+    g.add_argument("--w_init", type=float, default=0.5, help="initial lens/APSF mixture weight")
     g.add_argument("--kernel_lr", type=float, default=2e-3)
     g.add_argument("--emission_lr", type=float, default=0.01)
     g.add_argument("--lambda_emission", type=float, default=0.01)
@@ -169,7 +172,8 @@ def main():
     focal = focal_px_from_camera(cam0)
     halo = halo_opt = None
     if args.mode == "halo":
-        halo = HaloModel(kernel_kind=args.kernel, radius=radius, focal_px=focal, learn_kernel=not args.freeze_kernel).to(device)
+        halo = HaloModel(kernel_kind=args.kernel, radius=radius, focal_px=focal, learn_kernel=not args.freeze_kernel,
+                         gamma_min=args.gamma_min, gamma_init=args.gamma_init, w_init=args.w_init).to(device)
         groups = halo.param_groups(args.kernel_lr)
         halo_opt = torch.optim.Adam(groups, lr=0.0) if groups else None
         print(f"[halogs/lita] kernel={args.kernel} radius={radius}px focal={focal:.1f}px H={H} W={W}")

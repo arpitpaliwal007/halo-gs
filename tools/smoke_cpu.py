@@ -162,6 +162,8 @@ def write_tiny_colmap_scene(root, n_views=6, H=24, W=32, n_pts=60):
         img[H // 2 - 2: H // 2 + 2, W // 2 - 2 + i: W // 2 + 2 + i] = 255  # a 'lamp'
         img[:, :, 2] += (rng.random((H, W)) * 20).astype(np.uint8)
         Image.fromarray(img).save(os.path.join(root, "images", name))
+        os.makedirs(os.path.join(root, "high"), exist_ok=True)  # fake normal-light references for litalite
+        Image.fromarray(np.clip(img.astype(np.int32) * 3, 0, 255).astype(np.uint8)).save(os.path.join(root, "high", name))
     with open(os.path.join(sp, "images.txt"), "w") as fi:
         fi.writelines(lines)
 
@@ -185,19 +187,38 @@ def main():
 
     import train_glow, render_glow, eval_glow  # noqa: E402  (after patches)
 
-    for mode in ("halo", "masked", "vanilla"):
-        out = os.path.join(work, "out", "tiny", mode)
+    for run in ("halo", "masked", "vanilla", "litalite", "litalite_halo", "litalite_plus", "litalite_unet"):
+        mode = "litalite" if run in ("litalite_plus", "litalite_unet") else run
+        out = os.path.join(work, "out", "tiny", run)
         sys.argv = ["train_glow.py", "-s", scene, "-m", out, "--mode", mode, "--iterations", str(args.iters),
                     "--densify_from_iter", "10", "--densification_interval", "20", "--densify_until_iter", str(args.iters),
                     "--opacity_reset_interval", "40", "--glow_from_iter", "5", "--test_every", "30", "--log_every", "10",
                     "--save_iterations", str(args.iters), "--kernel_radius", "6", "--mask_radius", "4", "--quiet",
                     "--data_device", "cpu", "--gs_root", gs_root]
+        if mode.startswith("litalite"):
+            sys.argv += ["--clean_gt_dir", os.path.join(scene, "high")]
+        if run == "litalite_plus":
+            sys.argv += ["--illum_channels", "3", "--tone_curve", "--denoise_target", "bilateral"]
+        if run == "litalite_unet":
+            sys.argv += ["--illum_channels", "3", "--tone_curve", "--denoise_target", "n2n_unet",
+                         "--n2n_iters", "3", "--n2n_crop", "16", "--n2n_batch", "2", "--n2n_width", "8"]
         train_glow.main()
+        if run == "litalite_plus":
+            assert os.path.exists(os.path.join(out, f"point_cloud/iteration_{args.iters}/tone.pt"))
+            assert torch.load(os.path.join(out, f"point_cloud/iteration_{args.iters}/emission.pt"))["illum_raw"].shape[1] == 3
+        if run == "litalite_unet":
+            assert os.path.exists(os.path.join(out, "n2n_unet.pt"))
         for fn in ("split.json", "config.json", "log.csv", "cfg_args", f"point_cloud/iteration_{args.iters}/point_cloud.ply",
                    f"point_cloud/iteration_{args.iters}/emission.pt"):
             assert os.path.exists(os.path.join(out, fn)), fn
-        if mode == "halo":
+        if mode in ("halo", "litalite_halo"):
             assert os.path.exists(os.path.join(out, f"point_cloud/iteration_{args.iters}/halo.pt"))
+        if mode.startswith("litalite"):
+            blob = torch.load(os.path.join(out, f"point_cloud/iteration_{args.iters}/emission.pt"))
+            assert "illum_raw" in blob and blob["illum_raw"].shape[0] == blob["emission_raw"].shape[0]
+            import json as _json
+            last = [_json.loads(l) for l in open(os.path.join(out, "test_curve.jsonl"))][-1]
+            assert "clean_psnr" in last, last
 
         sys.argv = ["render_glow.py", "-m", out, "--iteration", str(args.iters), "--quiet", "--gs_root", gs_root]
         render_glow.main()
@@ -205,8 +226,13 @@ def main():
         assert os.path.exists(os.path.join(rd, "manifest.json"))
 
         sys.argv = ["eval_glow.py", "-m", out, "--iteration", str(args.iters), "--no_lpips", "--mask_radius", "4", "--device", "cpu"]
+        if mode.startswith("litalite"):
+            assert os.path.isdir(os.path.join(rd, "bright"))
+            sys.argv += ["--clean_gt_dir", os.path.join(scene, "high")]
         eval_glow.main()
         assert os.path.exists(os.path.join(rd, "metrics.json"))
+        if mode.startswith("litalite"):
+            assert os.path.exists(os.path.join(rd, "metrics_clean.json"))
 
     import aggregate_results
     sys.argv = ["aggregate_results.py", os.path.join(work, "out"), "--iteration", str(args.iters)]

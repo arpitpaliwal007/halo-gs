@@ -28,6 +28,7 @@ class HaloModel(nn.Module):
                  learn_kernel: bool = True, **kernel_kw):
         super().__init__()
         self.kernel_kind = kernel_kind
+        self.kernel_kw = dict(kernel_kw)
         self.kernel = make_kernel(kernel_kind, radius, focal_px, learn=learn_kernel, **kernel_kw)
         self.per_view_exposure = per_view_exposure
         self.name_to_idx: Dict[str, int] = {}
@@ -61,7 +62,7 @@ class HaloModel(nn.Module):
 
     # ---- i/o ------------------------------------------------------------------
     def save(self, path: str) -> None:
-        torch.save({"kernel_kind": self.kernel_kind,
+        torch.save({"kernel_kind": self.kernel_kind, "kernel_kw": getattr(self, "kernel_kw", {}),
                     "radius": getattr(self.kernel, "radius", None),
                     "focal_px": getattr(self.kernel, "focal_px", None),
                     "per_view_exposure": self.per_view_exposure,
@@ -73,7 +74,7 @@ class HaloModel(nn.Module):
         blob = torch.load(path, map_location="cpu")
         names = list(blob["name_to_idx"].keys()) if blob["per_view_exposure"] else None
         m = cls(kernel_kind=blob["kernel_kind"], radius=blob["radius"], focal_px=blob["focal_px"] or 600.0,
-                per_view_exposure=blob["per_view_exposure"], train_names=names)
+                per_view_exposure=blob["per_view_exposure"], train_names=names, **blob.get("kernel_kw", {}))
         m.name_to_idx = blob["name_to_idx"]
         m.load_state_dict(blob["state_dict"])
         return m.to(device)

@@ -29,7 +29,8 @@ class EmissiveGaussianModel(GaussianModel):
     EMISSION_INIT_RAW = -6.0  # softplus(-6) ~ 0.0025: start essentially dark
 
     def __init__(self, sh_degree: int, *args, emission_lr: float = 0.01,
-                 with_illum: bool = False, illum_lr: float = 0.01, illum_init: float = 0.5, **kwargs):
+                 with_illum: bool = False, illum_lr: float = 0.01, illum_init: float = 0.5,
+                 illum_channels: int = 1, **kwargs):
         super().__init__(sh_degree, *args, **kwargs)
         self._emission = torch.empty(0)
         self.emission_lr = float(emission_lr)
@@ -38,6 +39,8 @@ class EmissiveGaussianModel(GaussianModel):
         self.with_illum = bool(with_illum)
         self.illum_lr = float(illum_lr)
         self.illum_init = float(illum_init)
+        assert illum_channels in (1, 3), "illumination is grey (1) or RGB (3)"
+        self.illum_channels = int(illum_channels)
         self._illum = torch.empty(0)
 
     # ------------------------------------------------------------------ accessors
@@ -61,7 +64,7 @@ class EmissiveGaussianModel(GaussianModel):
         device = device or (self._xyz.device if self._xyz.numel() else "cuda")
         p = min(max(self.illum_init, 1e-3), 1 - 1e-3)
         raw = float(torch.logit(torch.tensor(p)))
-        self._illum = nn.Parameter(torch.full((n, 1), raw, device=device).requires_grad_(True))
+        self._illum = nn.Parameter(torch.full((n, self.illum_channels), raw, device=device).requires_grad_(True))
 
     def set_illum_init(self, p: float) -> None:
         """Reset every Gaussian's illumination to ``p`` (call before ``training_setup``)."""

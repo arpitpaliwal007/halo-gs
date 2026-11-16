@@ -160,6 +160,7 @@ Three cheap upgrades toward LITA-GS (each a flag, so each can be ablated):
 | `--illum_channels 3` | RGB illumination per Gaussian, so coloured light is not pushed into reflectance |
 | `--tone_curve` | learned per-view response `g_v * x^gamma_v` on the dark branch (identity at start; test views use the mean) |
 | `--denoise_target bilateral` | edge-preserving filter on the brightened target, where the gain amplifies sensor noise |
+| `--denoise_target n2n_unet` | U-Net (~3.7 M params) trained self-supervised with Neighbor2Neighbor on the scene's own dark *training* images (no clean data), then used to denoise each target; ~5-10 min extra on a T4 |
 
 `test_curve.jsonl` then holds both the dark-composite score against the observed photo
 (`psnr`) and the bright output against the normal-light reference (`clean_psnr`).

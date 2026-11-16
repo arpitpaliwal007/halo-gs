@@ -68,3 +68,21 @@ def test_splits_every8_and_glowgs_roundtrip():
         save_split(p, tr2, te2, "glowgs")
         s = load_split(p)
         assert s["mode"] == "glowgs" and len(s["train"]) == 6 and len(s["test"]) == 19
+
+
+class _Cam:
+    def __init__(self, n):
+        self.image_name = n
+
+
+def test_explicit_test_views_by_numeric_index_and_name():
+    from halogs.splits import make_split
+    cams = [_Cam(f"{i}.png") for i in range(25)]  # lexicographic order would put 10 before 2
+    train, test = make_split(cams, "views", test_views=["1", "17", "24", "9"])
+    assert [c.image_name for c in test] == ["1.png", "17.png", "24.png", "9.png"]
+    assert len(train) == 21 and not {c.image_name for c in train} & {c.image_name for c in test}
+    train2, test2 = make_split(cams, "views", test_views=["9", "24.png"], test_views_by="name")
+    assert sorted(c.image_name for c in test2) == ["24.png", "9.png"]
+    import pytest
+    with pytest.raises(ValueError):
+        make_split(cams, "views", test_views=["30"])

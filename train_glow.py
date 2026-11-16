@@ -73,7 +73,10 @@ def add_halo_args(p: argparse.ArgumentParser) -> None:
     g.add_argument("--glow_from_iter", type=int, default=500, help="iterations of plain 3DGS before glow is enabled")
     g.add_argument("--per_view_exposure", action="store_true", help="learn a log-gain per training view")
     g.add_argument("--exposure_lr", type=float, default=1e-3)
-    g.add_argument("--split", choices=["every8", "glowgs"], default="every8")
+    g.add_argument("--split", choices=["every8", "glowgs", "views"], default="every8")
+    g.add_argument("--test_views", nargs="+", default=None,
+                   help="with --split views: test views as indices (numeric name order) or names, e.g. 1 17 24 9")
+    g.add_argument("--test_views_by", choices=["index", "name"], default="index")
     g.add_argument("--n_train_views", type=int, default=6, help="for --split glowgs")
     g.add_argument("--mask_thresh", type=float, default=0.92)
     g.add_argument("--mask_radius", type=int, default=48)
@@ -148,7 +151,10 @@ def main():
 
     # ---- explicit split written to disk --------------------------------------------
     all_cams = scene.getTrainCameras() + scene.getTestCameras()
-    train_cams, test_cams = make_split(all_cams, args.split, args.n_train_views)
+    train_cams, test_cams = make_split(all_cams, args.split, args.n_train_views,
+                                       test_views=args.test_views, test_views_by=args.test_views_by)
+    if args.split == "views":
+        print(f"[halogs] explicit test views: {[c.image_name for c in test_cams]}")
     scene.train_cameras[1.0] = train_cams
     scene.test_cameras[1.0] = test_cams
     save_split(os.path.join(dataset.model_path, "split.json"), train_cams, test_cams, args.split)

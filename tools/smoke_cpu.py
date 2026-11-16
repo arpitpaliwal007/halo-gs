@@ -198,12 +198,15 @@ def main():
         if mode.startswith("litalite"):
             sys.argv += ["--clean_gt_dir", os.path.join(scene, "high")]
         if run == "litalite_plus":
-            sys.argv += ["--illum_channels", "3", "--tone_curve", "--denoise_target", "bilateral"]
+            sys.argv += ["--illum_channels", "3", "--tone_curve", "--denoise_target", "bilateral",
+                         "--split", "views", "--test_views", "1", "4"]
         if run == "litalite_unet":
             sys.argv += ["--illum_channels", "3", "--tone_curve", "--denoise_target", "n2n_unet",
                          "--n2n_iters", "3", "--n2n_crop", "16", "--n2n_batch", "2", "--n2n_width", "8"]
         train_glow.main()
         if run == "litalite_plus":
+            import json as _js
+            assert _js.load(open(os.path.join(out, "split.json")))["test"] == ["v01.png", "v04.png"]
             assert os.path.exists(os.path.join(out, f"point_cloud/iteration_{args.iters}/tone.pt"))
             assert torch.load(os.path.join(out, f"point_cloud/iteration_{args.iters}/emission.pt"))["illum_raw"].shape[1] == 3
         if run == "litalite_unet":

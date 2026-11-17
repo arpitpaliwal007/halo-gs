@@ -199,9 +199,12 @@ def main():
             sys.argv += ["--clean_gt_dir", os.path.join(scene, "high")]
         if run == "litalite_plus":
             sys.argv += ["--illum_channels", "3", "--tone_curve", "--denoise_target", "bilateral",
-                         "--split", "views", "--test_views", "1", "4"]
+                         "--split", "views", "--test_views", "1", "4",
+                         "--white_balance", "grayworld", "--target_gamma", "0.8"]
         if run == "litalite_unet":
-            sys.argv += ["--illum_channels", "3", "--tone_curve", "--denoise_target", "n2n_unet",
+            sys.argv += ["--illum_channels", "3", "--cam_model", "colour_curve", "--cam_knots", "8",
+                         "--w_expo", "0.5", "--w_col", "0.05", "--prior_from", "5", "--pseudo_fade", "10", "40",
+                         "--denoise_target", "n2n_unet",
                          "--n2n_iters", "3", "--n2n_crop", "16", "--n2n_batch", "2", "--n2n_width", "8"]
         train_glow.main()
         if run == "litalite_plus":

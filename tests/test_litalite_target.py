@@ -31,3 +31,20 @@ def test_unsaturated_pixels_identical_and_gain():
     assert torch.allclose(a, b) and torch.allclose(a.mean(), torch.tensor(0.40))
     c = brighten_target(img, gain=2.0)
     assert torch.allclose(c, img * 2.0)
+
+
+def test_grayworld_and_gamma():
+    from halogs.litalite import grayworld_gains
+
+    class C:
+        def __init__(self, im):
+            self.original_image = im
+    warm = torch.rand(3, 16, 16) * torch.tensor([0.12, 0.09, 0.05])[:, None, None]  # warm, dark capture
+    g = grayworld_gains([C(warm), C(warm * 0.9)])
+    t = brighten_target(warm, theta=0.40, wb_gains=g)
+    m = t.mean(dim=(1, 2))
+    assert (m.max() - m.min()) < 0.02            # neutral on average
+    assert abs(float(t.mean()) - 0.40) < 0.02    # brightness still set by theta
+    lifted = brighten_target(warm, theta=0.40, wb_gains=g, gamma=0.8)
+    assert lifted.mean() > t.mean()              # gamma < 1 lifts the image
+    assert torch.allclose(brighten_target(warm, gamma=1.0), brighten_target(warm))

@@ -38,7 +38,7 @@ from utils.general_utils import safe_state  # noqa: E402
 
 from halogs.gaussians import EmissiveGaussianModel  # noqa: E402
 from halogs.halo import HaloModel, render_halo  # noqa: E402
-from halogs.litalite import ToneCurve, render_litalite  # noqa: E402
+from halogs.litalite import load_camera_model, render_litalite  # noqa: E402
 from halogs.splits import load_split  # noqa: E402
 
 
@@ -111,7 +111,7 @@ def main():
 
     tone = None
     if os.path.exists(os.path.join(pc_dir, "tone.pt")):
-        tone = ToneCurve.load(os.path.join(pc_dir, "tone.pt"), device="cuda")
+        tone = load_camera_model(os.path.join(pc_dir, "tone.pt"), device="cuda")
         print("[halogs] tone curve:", tone.describe())
 
     split = load_split(os.path.join(dataset.model_path, "split.json"))

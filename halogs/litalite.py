@@ -52,20 +52,38 @@ def reflectance_colours(pc, cam) -> torch.Tensor:
 
 
 def brighten_target(img: torch.Tensor, theta: float = 0.40, gain: Optional[float] = None,
-                    hue_safe: bool = True) -> torch.Tensor:
-    """Linear brightening of a dark image (3,H,W).
+                    hue_safe: bool = True, wb_gains: Optional[torch.Tensor] = None,
+                    gamma: float = 1.0) -> torch.Tensor:
+    """Brightening of a dark image (3,H,W) into the bright pseudo-target.
 
-    gain = theta / mean(img) unless a (scene-wide) gain is given.  With ``hue_safe``
-    a pixel whose brightest channel would exceed 1 is divided by that channel, so
-    R:G:B ratios are preserved exactly; without it channels are clipped independently
-    (the original behaviour).
+    1. optional white balance: multiply channel c by ``wb_gains[c]`` (see :func:`grayworld_gains`);
+    2. linear gain = theta / mean(img) unless a (scene-wide) gain is given;
+    3. with ``hue_safe`` a pixel whose brightest channel would exceed 1 is divided by that
+       channel, so R:G:B ratios are preserved; otherwise channels are clipped independently
+       (the original behaviour);
+    4. optional tone curve t ** gamma (gamma < 1 lifts shadows and lowers contrast).
     """
-    g = float(gain) if gain is not None else theta / float(img.mean().clamp_min(1e-4))
-    t = img * g
+    x = img if wb_gains is None else img * wb_gains.to(img).view(3, 1, 1)
+    g = float(gain) if gain is not None else theta / float(x.mean().clamp_min(1e-4))
+    t = x * g
     if hue_safe:
         peak = t.max(dim=0, keepdim=True).values.clamp_min(1.0)
         t = t / peak
-    return t.clamp(0.0, 1.0)
+    t = t.clamp(0.0, 1.0)
+    if gamma != 1.0:
+        t = t.clamp_min(1e-6) ** gamma
+    return t
+
+
+def grayworld_gains(cams) -> torch.Tensor:
+    """Scene-wide grey-world white balance from the *training* dark images only.
+
+    Gains g_c = mean(all channels) / mean(channel c), so the average colour of the scene
+    becomes neutral grey while overall brightness is unchanged.  No reference image is used.
+    """
+    with torch.no_grad():
+        m = torch.stack([c.original_image.float().mean(dim=(1, 2)) for c in cams]).mean(0)
+    return (m.mean() / m.clamp_min(1e-6)).detach().cpu()
 
 
 def scene_gain(cams, theta: float = 0.40) -> float:
@@ -126,6 +144,98 @@ class ToneCurve(torch.nn.Module):
         m.name_to_idx = blob["name_to_idx"]
         m.load_state_dict(blob["state_dict"])
         return m.to(device)
+
+
+class ColourCurveCamera(torch.nn.Module):
+    """Per-view camera model on the dark branch (Luminance-GS style), tied to a global one.
+
+        y = T_v( M_v @ x + b_v )
+
+    M_v (3x3) and b_v start at identity / 0; T_v is a monotone piecewise-linear curve with
+    ``knots`` segments, parameterised by softmax increments (so it is monotone and maps 0->0,
+    1->scale).  Each view's curve is the global curve plus a per-view offset; the tie loss
+    keeps the offsets and the colour matrices small, so per-view parameters model exposure /
+    white-balance changes of the phone, not scene content.  Unseen views use the global curve
+    with identity colour.  Same interface as :class:`ToneCurve` (forward(x, name), describe, save, load).
+    """
+
+    kind = "colour_curve"
+
+    def __init__(self, train_names, knots: int = 16):
+        super().__init__()
+        self.name_to_idx = {n: i for i, n in enumerate(sorted(train_names))}
+        n = max(len(self.name_to_idx), 1)
+        self.knots = knots
+        self.g_logits = torch.nn.Parameter(torch.zeros(knots))           # global curve shape (identity)
+        self.g_logscale = torch.nn.Parameter(torch.zeros(1))
+        self.v_logits = torch.nn.Parameter(torch.zeros(n, knots))        # per-view offsets
+        self.v_logscale = torch.nn.Parameter(torch.zeros(n))
+        self.v_mat = torch.nn.Parameter(torch.zeros(n, 3, 3))            # M_v = I + v_mat
+        self.v_bias = torch.nn.Parameter(torch.zeros(n, 3))
+
+    def _curve(self, logits, logscale, x):
+        inc = torch.softmax(logits, 0)                                    # (K,) sums to 1
+        ys = torch.cat([inc.new_zeros(1), torch.cumsum(inc, 0)]) * torch.exp(logscale)
+        K = self.knots
+        u = x.clamp(0, 1) * K
+        i = u.floor().clamp(max=K - 1).long()
+        f = u - i.to(u.dtype)
+        return ys[i] * (1 - f) + ys[i + 1] * f
+
+    def forward(self, x: torch.Tensor, name) -> torch.Tensor:
+        i = self.name_to_idx.get(name)
+        if i is None:
+            return self._curve(self.g_logits, self.g_logscale[0], x)
+        M = torch.eye(3, device=x.device, dtype=x.dtype) + self.v_mat[i]
+        y = torch.einsum("ij,jhw->ihw", M, x) + self.v_bias[i].view(3, 1, 1)
+        return self._curve(self.g_logits + self.v_logits[i], self.g_logscale[0] + self.v_logscale[i], y)
+
+    def tie_loss(self) -> torch.Tensor:
+        return (self.v_logits.pow(2).mean() + self.v_logscale.pow(2).mean()
+                + self.v_mat.pow(2).mean() + self.v_bias.pow(2).mean())
+
+    def describe(self) -> dict:
+        with torch.no_grad():
+            ident = self._curve(self.g_logits, self.g_logscale[0], torch.tensor([0.1, 0.5, 1.0], device=self.g_logits.device))
+            return {"global_at_0.1_0.5_1": [round(float(v), 4) for v in ident],
+                    "mat_dev": float(self.v_mat.abs().mean()), "curve_dev": float(self.v_logits.abs().mean())}
+
+    def save(self, path):
+        torch.save({"kind": self.kind, "knots": self.knots, "name_to_idx": self.name_to_idx,
+                    "state_dict": self.state_dict()}, path)
+
+
+def load_camera_model(path, device="cuda"):
+    """Load either a :class:`ToneCurve` or a :class:`ColourCurveCamera` saved as tone.pt."""
+    blob = torch.load(path, map_location="cpu")
+    if blob.get("kind") == "colour_curve":
+        m = ColourCurveCamera(list(blob["name_to_idx"].keys()), blob["knots"])
+        m.name_to_idx = blob["name_to_idx"]
+        m.load_state_dict(blob["state_dict"])
+        return m.to(device)
+    return ToneCurve.load(path, device)
+
+
+def exposure_loss(img: torch.Tensor, target: float = 0.6, patch: int = 16) -> torch.Tensor:
+    """Zero-DCE exposure control: mean luminance of each patch pulled toward ``target``."""
+    y = img.mean(0, keepdim=True).unsqueeze(0)
+    m = torch.nn.functional.avg_pool2d(y, patch, patch)
+    return (m - target).pow(2).mean()
+
+
+def colour_constancy_loss(img: torch.Tensor) -> torch.Tensor:
+    """Zero-DCE colour constancy: channel means of the image should be close to each other."""
+    r, g, b = img.mean(dim=(1, 2))
+    return (r - g).pow(2) + (r - b).pow(2) + (g - b).pow(2)
+
+
+def pseudo_weight(it: int, start: int, end: int) -> float:
+    """Pseudo-target weight multiplier: 1 until ``start``, linear to 0 at ``end`` (end<=0: never fades)."""
+    if end <= 0 or it <= start:
+        return 1.0
+    if it >= end:
+        return 0.0
+    return 1.0 - (it - start) / float(end - start)
 
 
 def bilateral(img: torch.Tensor, radius: int = 2, sigma_s: float = 1.5, sigma_r: float = 0.08) -> torch.Tensor:

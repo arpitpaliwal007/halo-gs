@@ -187,8 +187,8 @@ def main():
 
     import train_glow, render_glow, eval_glow  # noqa: E402  (after patches)
 
-    for run in ("halo", "masked", "vanilla", "litalite", "litalite_halo", "litalite_plus", "litalite_unet"):
-        mode = "litalite" if run in ("litalite_plus", "litalite_unet") else run
+    for run in ("halo", "masked", "vanilla", "litalite", "litalite_halo", "litalite_plus", "litalite_unet", "litalite_nodn"):
+        mode = "litalite" if run in ("litalite_plus", "litalite_unet", "litalite_nodn") else run
         out = os.path.join(work, "out", "tiny", run)
         sys.argv = ["train_glow.py", "-s", scene, "-m", out, "--mode", mode, "--iterations", str(args.iters),
                     "--densify_from_iter", "10", "--densification_interval", "20", "--densify_until_iter", str(args.iters),
@@ -206,7 +206,10 @@ def main():
                          "--w_expo", "0.5", "--w_col", "0.05", "--prior_from", "5", "--pseudo_fade", "10", "40",
                          "--target_curve", "nova", "--nova_radius", "4", "--w_sh_noise", "1.0", "--w_spa", "1.0", "--w_ill", "0.1", "--rel_l1",
                          "--denoise_target", "n2n_unet",
-                         "--n2n_iters", "3", "--n2n_crop", "16", "--n2n_batch", "2", "--n2n_width", "8"]
+                         "--n2n_iters", "3", "--n2n_crop", "16", "--n2n_batch", "2", "--n2n_width", "8", "--dump_targets", "2"]
+        if run == "litalite_nodn":  # v4 without the denoiser: SH penalty uses the guided-filter noise map
+            sys.argv += ["--illum_channels", "3", "--target_curve", "nova", "--nova_radius", "4", "--w_sh_noise", "1.0",
+                         "--sh_noise_src", "guided", "--denoise_target", "none", "--dump_targets", "2"]
         train_glow.main()
         if run == "litalite_plus":
             import json as _js

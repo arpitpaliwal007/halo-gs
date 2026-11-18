@@ -43,7 +43,7 @@ from utils.general_utils import safe_state  # noqa: E402
 
 from halogs.gaussians import EmissiveGaussianModel  # noqa: E402
 from halogs.halo import HaloModel, focal_px_from_camera, render_halo  # noqa: E402
-from halogs.litalite import nova_maps, nova_gamma, nova_target, sh_noise_penalty, apply_luma_curve, he_curve, illum_prior_loss, relative_photometric_loss, spatial_consistency_loss, ColourCurveCamera, ToneCurve, bilateral, colour_constancy_loss, exposure_loss, pseudo_weight, brighten_target, grayworld_gains, illum_init_from, render_litalite, scene_gain  # noqa: E402
+from halogs.litalite import guided_filter_self, noise_sigma, nova_maps, nova_gamma, nova_target, sh_noise_penalty, apply_luma_curve, he_curve, illum_prior_loss, relative_photometric_loss, spatial_consistency_loss, ColourCurveCamera, ToneCurve, bilateral, colour_constancy_loss, exposure_loss, pseudo_weight, brighten_target, grayworld_gains, illum_init_from, render_litalite, scene_gain  # noqa: E402
 from halogs.losses import emission_sparsity, glow_tv, photometric_loss  # noqa: E402
 from halogs.masks import glow_mask  # noqa: E402
 from halogs.metrics import all_metrics  # noqa: E402
@@ -114,6 +114,9 @@ def add_halo_args(p: argparse.ArgumentParser) -> None:
     g.add_argument("--nova_mean", type=float, default=0.5, help="NOVA-GS target exposure for the gamma binary search")
     g.add_argument("--nova_radius", type=int, default=16, help="guided-filter radius (16 -> 33x33 window, as NOVA-GS)")
     g.add_argument("--w_sh_noise", type=float, default=0.0, help="NOVA-GS noise-guided penalty on higher-order SH")
+    g.add_argument("--sh_noise_src", choices=["denoiser", "guided"], default="denoiser",
+                   help="noise map for the SH penalty: |raw - denoised| target, or the guided-filter residual (no denoiser needed)")
+    g.add_argument("--dump_targets", type=int, default=0, help="save the bright targets of the first N training views")
     g.add_argument("--target_curve", choices=["linear", "he", "nova"], default="linear",
                    help="he = scene luminance curve 0.5*HE-CDF + 0.5*linear gain from the training dark images (Luminance-GS prior)")
     g.add_argument("--he_blend", type=float, default=0.5)
@@ -236,6 +239,12 @@ def main():
 
     nova_g = None
     noise_cache = {}
+    dumped = []
+
+    def _save_png(x, path):  # (C,H,W) in [0,1] -> 8-bit PNG (PIL, no torchvision needed)
+        from PIL import Image
+        a = (x.detach().float().clamp(0, 1).cpu().numpy() * 255 + 0.5).astype("uint8")
+        Image.fromarray(a[0] if a.shape[0] == 1 else a.transpose(1, 2, 0)).save(path)
 
     def _src(gt):
         if n2n_net is not None:
@@ -266,9 +275,14 @@ def main():
             if nova_g is not None:
                 with torch.no_grad():
                     t = nova_target(src, _gain(src), nova_g, args.nova_radius)
-                    if args.w_sh_noise > 0:  # noise map = |enhanced raw - enhanced denoised|, channel mean
+                    if args.w_sh_noise > 0:
                         t_raw = nova_target(gt, _gain(src), nova_g, args.nova_radius)
-                        noise_cache[cam.image_name] = (t_raw - t).abs().mean(0)
+                        if n2n_net is not None and args.sh_noise_src == "denoiser":
+                            # noise map = |enhanced raw - enhanced denoised|, channel mean
+                            noise_cache[cam.image_name] = (t_raw - t).abs().mean(0)
+                        else:  # denoiser-free: high-frequency residual of the enhanced raw target
+                            eps = max(4.0 * noise_sigma(t_raw) ** 2, 1e-5)
+                            noise_cache[cam.image_name] = (t_raw - guided_filter_self(t_raw, 2, eps)).abs().mean(0)
             elif he_lut is not None:
                 t = apply_luma_curve(src, he_lut)
             else:
@@ -278,6 +292,14 @@ def main():
                 with torch.no_grad():
                     t = bilateral(t, args.dn_radius, args.dn_sigma_s, args.dn_sigma_r)
             target_cache[cam.image_name] = t.detach()
+            if len(dumped) < args.dump_targets:  # save the bright pseudo-targets (to inspect blur / texture loss)
+                d = os.path.join(dataset.model_path, "targets"); os.makedirs(d, exist_ok=True)
+                _save_png(t.clamp(0, 1), os.path.join(d, f"{cam.image_name.split('.')[0]}_target.png"))
+                _save_png(gt.clamp(0, 1), os.path.join(d, f"{cam.image_name.split('.')[0]}_dark.png"))
+                if cam.image_name in noise_cache:
+                    nm = noise_cache[cam.image_name]
+                    _save_png((nm / nm.max().clamp_min(1e-6))[None], os.path.join(d, f"{cam.image_name.split('.')[0]}_noise.png"))
+                dumped.append(cam.image_name)
         return target_cache[cam.image_name]
     if lit:
         print(f"[litalite] illumination channels={args.illum_channels} tone_curve={bool(tone)} "

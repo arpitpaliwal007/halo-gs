@@ -38,7 +38,7 @@ from utils.general_utils import safe_state  # noqa: E402
 
 from halogs.gaussians import EmissiveGaussianModel  # noqa: E402
 from halogs.halo import HaloModel, render_halo  # noqa: E402
-from halogs.litalite import load_camera_model, render_litalite  # noqa: E402
+from halogs.litalite import Relight3D, load_camera_model, render_litalite  # noqa: E402
 from halogs.splits import load_split  # noqa: E402
 
 
@@ -48,7 +48,7 @@ def to_png(t: torch.Tensor, path: str, scale: float = 1.0) -> None:
 
 
 @torch.no_grad()
-def render_set(out_dir, cams, gaussians, pipe, bg, halo, mode, save_npy, tone=None):
+def render_set(out_dir, cams, gaussians, pipe, bg, halo, mode, save_npy, tone=None, relight=None):
     lit = mode.startswith("litalite")
     subs = ("render", "scene", "glow", "emission", "gt") + (("bright",) if lit else ())
     for sub in subs:
@@ -56,7 +56,7 @@ def render_set(out_dir, cams, gaussians, pipe, bg, halo, mode, save_npy, tone=No
     manifest = []
     for cam in cams:
         if lit:
-            pkg = render_litalite(render, cam, gaussians, pipe, bg, halo, use_glow=halo is not None, tone=tone)
+            pkg = render_litalite(render, cam, gaussians, pipe, bg, halo, use_glow=halo is not None, tone=tone, relight=relight)
         else:
             pkg = render_halo(render, cam, gaussians, pipe, bg, halo, mode=mode)
         name = cam.image_name
@@ -113,6 +113,10 @@ def main():
     if os.path.exists(os.path.join(pc_dir, "tone.pt")):
         tone = load_camera_model(os.path.join(pc_dir, "tone.pt"), device="cuda")
         print("[halogs] tone curve:", tone.describe())
+    relight = None
+    if os.path.exists(os.path.join(pc_dir, "relight.json")):
+        relight = Relight3D.load(os.path.join(pc_dir, "relight.json"))
+        print(f"[halogs] 3D relighting: k {relight.k:.3f} gamma {relight.gamma:.3f}")
 
     split = load_split(os.path.join(dataset.model_path, "split.json"))
     by_name = {c.image_name: c for c in scene.getTrainCameras() + scene.getTestCameras()}
@@ -124,9 +128,9 @@ def main():
 
     bg = torch.tensor([1, 1, 1] if dataset.white_background else [0, 0, 0], dtype=torch.float32, device="cuda")
     base = os.path.join(dataset.model_path, "renders", f"iteration_{it}")
-    render_set(os.path.join(base, "test"), test_cams, gaussians, pipe, bg, halo, mode, args.save_npy, tone)
+    render_set(os.path.join(base, "test"), test_cams, gaussians, pipe, bg, halo, mode, args.save_npy, tone, relight)
     if not args.skip_train:
-        render_set(os.path.join(base, "train"), train_cams, gaussians, pipe, bg, halo, mode, args.save_npy, tone)
+        render_set(os.path.join(base, "train"), train_cams, gaussians, pipe, bg, halo, mode, args.save_npy, tone, relight)
     print(f"[halogs] wrote {base}")
 
 

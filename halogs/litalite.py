@@ -458,9 +458,101 @@ def bilateral(img: torch.Tensor, radius: int = 2, sigma_s: float = 1.5, sigma_r:
     return out.squeeze(0)
 
 
+# ----------------------------------------------------------------------------- 3D relighting (Idea A)
+class Relight3D:
+    """Enhancement as relighting of the learned 3D illumination field.
+
+    Every Gaussian has reflectance R and illumination L (dark = R * L).  The enhanced output is
+        O = splat(R * T(L)),   T(L) = clamp(k * L, 0, 1) ** gamma
+    k  : white point of the illumination (1 / q-th percentile of L's luminance over all Gaussians),
+         so the best-lit parts of the scene become fully lit;
+    gamma: one scene-level exponent, set so that the mean brightness of O over a few training views
+         equals ``target_mean`` (the same fixed rule as the 2D target, applied in 3D).
+    Both are re-estimated periodically during training (no gradient through them) and saved.
+    """
+
+    def __init__(self, k: float = 1.0, gamma: float = 1.0):
+        self.k, self.gamma = float(k), float(gamma)
+
+    def T(self, L: torch.Tensor) -> torch.Tensor:
+        return (L * self.k).clamp(1e-6, 1.0) ** self.gamma
+
+    def save(self, path):
+        import json
+        with open(path, "w") as f:
+            json.dump({"k": self.k, "gamma": self.gamma}, f)
+
+    @classmethod
+    def load(cls, path):
+        import json
+        with open(path) as f:
+            d = json.load(f)
+        return cls(d["k"], d["gamma"])
+
+
+def illum_white_point(pc, q: float = 0.99) -> float:
+    with torch.no_grad():
+        L = pc.get_illum
+        y = L.mean(1) if L.shape[1] == 3 else L[:, 0]
+        if y.numel() > 2_000_000:
+            y = y[torch.randperm(y.numel(), device=y.device)[:2_000_000]]
+        return 1.0 / float(torch.quantile(y, q).clamp_min(1e-6))
+
+
+def fit_relight_gamma(render_fn, cams, pc, pipe, bg, k: float, target_mean: float = 0.5,
+                      lo: float = 0.05, hi: float = 3.0, iters: int = 12) -> float:
+    """Binary search for gamma so that mean(O) over ``cams`` equals target_mean (O darkens as gamma grows)."""
+    kw = _render_kwargs(render_fn)
+    with torch.no_grad():
+        refls = [reflectance_colours(pc, c) for c in cams]
+        for _ in range(iters):
+            mid = 0.5 * (lo + hi)
+            T = Relight3D(k, mid).T(pc.get_illum)
+            m = sum(float(render_fn(c, pc, pipe, bg, override_color=r * T, **kw)["render"].clamp(0, 1).mean())
+                    for c, r in zip(cams, refls)) / len(cams)
+            if m > target_mean:
+                lo = mid
+            else:
+                hi = mid
+    return 0.5 * (lo + hi)
+
+
+def illum_knn_smooth(pc, n_anchor: int = 2048, n_pool: int = 16384) -> torch.Tensor:
+    """3D smoothness of illumination: random anchor Gaussians vs their 8 nearest neighbours in a random pool,
+    weighted by exp(-d^2 / s^2) with s the median neighbour distance (no edge cases with few Gaussians)."""
+    N = pc.get_xyz.shape[0]
+    if N < 16:
+        return pc.get_illum.sum() * 0
+    dev = pc.get_xyz.device
+    ia = torch.randint(0, N, (min(n_anchor, N),), device=dev)
+    ip = torch.randint(0, N, (min(n_pool, N),), device=dev)
+    xa, xp = pc.get_xyz[ia].detach(), pc.get_xyz[ip].detach()
+    d2 = torch.cdist(xa, xp) ** 2
+    k = min(9, xp.shape[0])
+    dk, jk = d2.topk(k, dim=1, largest=False)
+    dk, jk = dk[:, 1:], jk[:, 1:]                       # drop a possible self-match
+    s2 = dk.median().clamp_min(1e-12)
+    w = torch.exp(-dk / s2)
+    L = pc.get_illum
+    diff = (L[ia][:, None, :] - L[ip][jk]).abs().mean(-1)
+    return (w * diff).sum() / w.sum().clamp_min(1e-8)
+
+
+def white_patch_loss(pc, cam, visible: torch.Tensor, q: float = 0.99) -> torch.Tensor:
+    """White-patch Retinex on reflectance: the q-th percentile of max_c R over visible Gaussians should be 1."""
+    r = reflectance_colours(pc, cam)[visible]
+    if r.shape[0] < 10:
+        return r.sum() * 0
+    m = r.max(1).values
+    if m.numel() > 500_000:
+        m = m[torch.randperm(m.numel(), device=m.device)[:500_000]]
+    return (1.0 - torch.quantile(m, q)).clamp_min(0) ** 2
+
+
 def render_litalite(render_fn, cam, pc, pipe, bg_color: torch.Tensor, halo: Optional[HaloModel] = None,
                     use_glow: bool = False, clamp: bool = True,
-                    tone: Optional["ToneCurve"] = None, illum_map: bool = False) -> dict:
+                    tone: Optional["ToneCurve"] = None, illum_map: bool = False,
+                    relight: Optional["Relight3D"] = None) -> dict:
     """Bright (reflectance) render, dark render (reflectance * illumination) and optional glow.
 
     Returned keys:
@@ -473,7 +565,9 @@ def render_litalite(render_fn, cam, pc, pipe, bg_color: torch.Tensor, halo: Opti
     """
     kw = _render_kwargs(render_fn)
     refl = reflectance_colours(pc, cam)
-    b = render_fn(cam, pc, pipe, bg_color, override_color=refl, **kw)
+    # bright output: reflectance alone, or (3D relighting) reflectance x tone-mapped 3D illumination
+    b_col = refl if relight is None else refl * relight.T(pc.get_illum)
+    b = render_fn(cam, pc, pipe, bg_color, override_color=b_col, **kw)
     d = render_fn(cam, pc, pipe, bg_color, override_color=refl * pc.get_illum, **kw)
     bright, dark = b["render"], d["render"]
     out = {"bright": bright, "scene": dark,

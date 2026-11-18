@@ -43,7 +43,7 @@ from utils.general_utils import safe_state  # noqa: E402
 
 from halogs.gaussians import EmissiveGaussianModel  # noqa: E402
 from halogs.halo import HaloModel, focal_px_from_camera, render_halo  # noqa: E402
-from halogs.litalite import reinhard_key, guided_filter_self, noise_sigma, nova_maps, nova_gamma, nova_target, sh_noise_penalty, apply_luma_curve, he_curve, illum_prior_loss, relative_photometric_loss, spatial_consistency_loss, ColourCurveCamera, ToneCurve, bilateral, colour_constancy_loss, exposure_loss, pseudo_weight, brighten_target, grayworld_gains, illum_init_from, render_litalite, scene_gain  # noqa: E402
+from halogs.litalite import Relight3D, fit_relight_gamma, illum_knn_smooth, illum_white_point, white_patch_loss, reinhard_key, guided_filter_self, noise_sigma, nova_maps, nova_gamma, nova_target, sh_noise_penalty, apply_luma_curve, he_curve, illum_prior_loss, relative_photometric_loss, spatial_consistency_loss, ColourCurveCamera, ToneCurve, bilateral, colour_constancy_loss, exposure_loss, pseudo_weight, brighten_target, grayworld_gains, illum_init_from, render_litalite, scene_gain  # noqa: E402
 from halogs.losses import emission_sparsity, glow_tv, photometric_loss  # noqa: E402
 from halogs.masks import glow_mask  # noqa: E402
 from halogs.metrics import all_metrics  # noqa: E402
@@ -112,6 +112,15 @@ def add_halo_args(p: argparse.ArgumentParser) -> None:
                         "colour_curve = per-view 3x3 colour matrix + knot curve tied to a global curve")
     g.add_argument("--cam_knots", type=int, default=16)
     g.add_argument("--nova_mean", type=float, default=0.5, help="NOVA-GS target exposure for the gamma binary search")
+    g.add_argument("--relight3d", action="store_true",
+                   help="Idea A: enhanced output = splat(R * T(L)), T = clamp(k L)^gamma on the learned 3D illumination")
+    g.add_argument("--relight_from", type=int, default=5000, help="iterations of plain v5 (bright = R) before relighting")
+    g.add_argument("--relight_every", type=int, default=1000, help="re-estimate k and gamma every N iterations")
+    g.add_argument("--relight_mean", type=float, default=0.5, help="target mean brightness of the relit output")
+    g.add_argument("--relight_q", type=float, default=0.99, help="illumination percentile mapped to fully lit")
+    g.add_argument("--w_anchor", type=float, default=0.1, help="weight of the 2D pseudo-target once relighting is on")
+    g.add_argument("--w_lsmooth", type=float, default=1.0, help="3D kNN smoothness of illumination (relighting phase)")
+    g.add_argument("--w_wp", type=float, default=0.1, help="white-patch Retinex on reflectance (relighting phase)")
     g.add_argument("--nova_mean_rule", choices=["fixed", "reinhard"], default="fixed",
                    help="reinhard = scene-adaptive target exposure from Reinhard (2002) automatic key estimation "
                         "on the training dark images (replaces --nova_mean)")
@@ -364,8 +373,16 @@ def main():
     ema_loss = 0.0
     t0 = time.time()
     last_t = t0
+    relight = None
     for iteration in range(1, opt.iterations + 1):
         gaussians.update_learning_rate(iteration)
+        relit = lit and args.relight3d and iteration > args.relight_from
+        if relit and (relight is None or iteration % args.relight_every == 0):
+            k = illum_white_point(gaussians, args.relight_q)
+            fit_cams = [train_cams[i] for i in range(0, len(train_cams), max(1, len(train_cams) // 3))][:3]
+            g_r = fit_relight_gamma(render, fit_cams, gaussians, pipe, bg, k, args.relight_mean)
+            relight = Relight3D(k, g_r)
+            print(f"\n[relight3d] iter {iteration}: k {k:.2f}  gamma {g_r:.3f}")
         if iteration % 1000 == 0:
             gaussians.oneupSHdegree()
 
@@ -378,14 +395,14 @@ def main():
         l_exp = l_rec = None
         if lit:
             pkg = render_litalite(render, cam, gaussians, pipe, bg, halo, use_glow=use_glow, tone=tone,
-                                  illum_map=args.w_ill > 0)
+                                  illum_map=args.w_ill > 0, relight=relight if relit else None)
             target = lit_target(cam, gt)
             l_exp, _ = photometric_loss(pkg["bright"], target, opt.lambda_dssim)
             if args.rel_l1:
                 l_rec, l1 = relative_photometric_loss(pkg["render"], gt, opt.lambda_dssim)
             else:
                 l_rec, l1 = photometric_loss(pkg["render"], gt, opt.lambda_dssim)
-            w_ps = args.w_exp * pseudo_weight(iteration, *args.pseudo_fade)
+            w_ps = (args.w_anchor if relit else args.w_exp) * pseudo_weight(iteration, *args.pseudo_fade)
             loss = w_ps * l_exp + args.w_rec * l_rec
             if args.w_tv > 0:
                 loss = loss + args.w_tv * glow_tv(pkg["bright"])
@@ -401,6 +418,11 @@ def main():
                                                                  pkg["visibility_filter"])
             if args.w_ill > 0:
                 loss = loss + args.w_ill * illum_prior_loss(pkg["illum_map"], gt, target, args.ill_smooth)
+            if relit:
+                if args.w_lsmooth > 0:
+                    loss = loss + args.w_lsmooth * illum_knn_smooth(gaussians)
+                if args.w_wp > 0:
+                    loss = loss + args.w_wp * white_patch_loss(gaussians, cam, pkg["visibility_filter"])
             if isinstance(tone, ColourCurveCamera) and args.w_tie > 0:
                 loss = loss + args.w_tie * tone.tie_loss()
         else:
@@ -465,7 +487,8 @@ def main():
 
             # held-out evaluation (composite vs observed reference)
             if iteration % args.test_every == 0 or iteration == opt.iterations:
-                evaluate(iteration, test_cams, gaussians, pipe, bg, halo, args, dataset.model_path, use_glow, clean_refs, tone)
+                evaluate(iteration, test_cams, gaussians, pipe, bg, halo, args, dataset.model_path, use_glow, clean_refs, tone,
+                         relight=relight if relit else None)
 
             if iteration in args.save_iterations or iteration == opt.iterations:
                 print(f"\n[ITER {iteration}] saving")
@@ -476,6 +499,8 @@ def main():
                     halo.save(os.path.join(pc_dir, "halo.pt"))
                 if tone is not None:
                     tone.save(os.path.join(pc_dir, "tone.pt"))
+                if relit and relight is not None:
+                    relight.save(os.path.join(pc_dir, "relight.json"))
 
     log_f.close()
     print(f"\n[halogs] done in {(time.time() - t0) / 60:.1f} min -> {dataset.model_path}")
@@ -499,14 +524,15 @@ def _load_ref(path, like):
 
 
 @torch.no_grad()
-def evaluate(iteration, test_cams, gaussians, pipe, bg, halo, args, model_path, glow_on, clean_refs=None, tone=None):
+def evaluate(iteration, test_cams, gaussians, pipe, bg, halo, args, model_path, glow_on, clean_refs=None, tone=None,
+             relight=None):
     if not test_cams:
         return
     lit = args.mode.startswith("litalite")
     rows, crow = [], []
     for cam in test_cams:
         if lit:
-            pkg = render_litalite(render, cam, gaussians, pipe, bg, halo, use_glow=glow_on, tone=tone)
+            pkg = render_litalite(render, cam, gaussians, pipe, bg, halo, use_glow=glow_on, tone=tone, relight=relight)
         else:
             pkg = render_halo(render, cam, gaussians, pipe, bg, halo, mode="halo" if glow_on else "vanilla")
         gt = cam.original_image.to(pkg["render"].device)

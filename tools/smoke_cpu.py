@@ -209,7 +209,7 @@ def main():
                          "--n2n_iters", "3", "--n2n_crop", "16", "--n2n_batch", "2", "--n2n_width", "8", "--dump_targets", "2"]
         if run == "litalite_nodn":  # v4 without the denoiser: SH penalty uses the guided-filter noise map
             sys.argv += ["--illum_channels", "3", "--target_curve", "nova", "--nova_radius", "4", "--w_sh_noise", "1.0",
-                         "--sh_noise_src", "guided", "--denoise_target", "none", "--dump_targets", "2"]
+                         "--sh_noise_src", "guided", "--denoise_target", "none", "--dump_targets", "2", "--nova_mean_rule", "reinhard"]
         train_glow.main()
         if run == "litalite_plus":
             import json as _js

@@ -43,7 +43,7 @@ from utils.general_utils import safe_state  # noqa: E402
 
 from halogs.gaussians import EmissiveGaussianModel  # noqa: E402
 from halogs.halo import HaloModel, focal_px_from_camera, render_halo  # noqa: E402
-from halogs.litalite import guided_filter_self, noise_sigma, nova_maps, nova_gamma, nova_target, sh_noise_penalty, apply_luma_curve, he_curve, illum_prior_loss, relative_photometric_loss, spatial_consistency_loss, ColourCurveCamera, ToneCurve, bilateral, colour_constancy_loss, exposure_loss, pseudo_weight, brighten_target, grayworld_gains, illum_init_from, render_litalite, scene_gain  # noqa: E402
+from halogs.litalite import reinhard_key, guided_filter_self, noise_sigma, nova_maps, nova_gamma, nova_target, sh_noise_penalty, apply_luma_curve, he_curve, illum_prior_loss, relative_photometric_loss, spatial_consistency_loss, ColourCurveCamera, ToneCurve, bilateral, colour_constancy_loss, exposure_loss, pseudo_weight, brighten_target, grayworld_gains, illum_init_from, render_litalite, scene_gain  # noqa: E402
 from halogs.losses import emission_sparsity, glow_tv, photometric_loss  # noqa: E402
 from halogs.masks import glow_mask  # noqa: E402
 from halogs.metrics import all_metrics  # noqa: E402
@@ -112,6 +112,9 @@ def add_halo_args(p: argparse.ArgumentParser) -> None:
                         "colour_curve = per-view 3x3 colour matrix + knot curve tied to a global curve")
     g.add_argument("--cam_knots", type=int, default=16)
     g.add_argument("--nova_mean", type=float, default=0.5, help="NOVA-GS target exposure for the gamma binary search")
+    g.add_argument("--nova_mean_rule", choices=["fixed", "reinhard"], default="fixed",
+                   help="reinhard = scene-adaptive target exposure from Reinhard (2002) automatic key estimation "
+                        "on the training dark images (replaces --nova_mean)")
     g.add_argument("--nova_radius", type=int, default=16, help="guided-filter radius (16 -> 33x33 window, as NOVA-GS)")
     g.add_argument("--w_sh_noise", type=float, default=0.0, help="NOVA-GS noise-guided penalty on higher-order SH")
     g.add_argument("--sh_noise_src", choices=["denoiser", "guided"], default="denoiser",
@@ -256,16 +259,24 @@ def main():
 
     if lit and args.target_curve == "nova":
         with torch.no_grad():
-            maps = []
+            maps, srcs = [], []
             for c in train_cams:  # training views only
                 im = _src(c.original_image.to(device))
+                srcs.append(im)
                 maps.append(nova_maps(im, _gain(im), args.nova_radius)[0])
+            if args.nova_mean_rule == "reinhard":
+                disp, key, f = reinhard_key(srcs)
+                print(f"[litalite] Reinhard key: f={f:.3f} key={key:.4f} -> target mean {disp:.4f} (fixed default was {args.nova_mean})")
+                args.nova_mean = disp
+            del srcs
             nova_g = nova_gamma(maps, args.nova_mean)
             del maps
         print(f"[litalite] NOVA-GS target: exposure-normalised (theta {args.theta}), guided filter r={args.nova_radius}, "
               f"gamma by binary search to mean {args.nova_mean} -> gamma = {nova_g:.4f}")
         with open(os.path.join(dataset.model_path, "nova_gamma.txt"), "w") as f:
             f.write(f"{nova_g}\n")
+        with open(os.path.join(dataset.model_path, "nova_mean.txt"), "w") as f:
+            f.write(f"{args.nova_mean}\n")
 
     def lit_target(cam, gt):
         if cam.image_name not in target_cache:

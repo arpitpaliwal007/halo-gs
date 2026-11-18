@@ -369,6 +369,34 @@ def nova_gamma(maps, target_mean: float = 0.5, lo: float = 0.05, hi: float = 3.0
     return 0.5 * (lo + hi)
 
 
+def reinhard_key(images, lo_pct: float = 1.0, hi_pct: float = 99.0, display_gamma: float = 2.2,
+                 clamp=(0.25, 0.6)):
+    """Reinhard (2002) automatic key estimation, used as a scene-adaptive target exposure.
+
+    On the linearised luminance (sRGB ** display_gamma) of the given dark images:
+        f   = (2 log2 Lav - log2 Lmin - log2 Lmax) / (log2 Lmax - log2 Lmin)
+        key = 0.18 * 4 ** f
+    with Lav the log-average and Lmin / Lmax robust percentiles.  The formula is invariant to the
+    capture exposure (a global scale), so it depends only on how the scene's light is distributed:
+    mostly-dark, high-contrast scenes get a low key, evenly lit scenes a key near 0.18.
+    Returned as a display-space mean key ** (1 / display_gamma) (0.18 -> 0.459, close to NOVA-GS's
+    fixed 0.5), clamped to ``clamp``.  Returns (display_mean, key, f).
+    """
+    with torch.no_grad():
+        y = torch.cat([im.float().mean(0).flatten() for im in images]).clamp(1e-6, 1) ** display_gamma
+        if y.numel() > 4_000_000:
+            y = y[torch.randperm(y.numel(), device=y.device)[:4_000_000]]
+        eps = 1e-6
+        lmin = torch.quantile(y, lo_pct / 100).clamp_min(eps)
+        lmax = torch.quantile(y, hi_pct / 100).clamp_min(lmin * 1.0001)
+        lav = torch.exp(torch.log(y + eps).mean())
+        l2 = torch.log2
+        f = float((2 * l2(lav) - l2(lmin) - l2(lmax)) / (l2(lmax) - l2(lmin)))
+        key = 0.18 * 4 ** f
+        disp = min(max(key ** (1 / display_gamma), clamp[0]), clamp[1])
+    return disp, key, f
+
+
 def nova_target(img: torch.Tensor, gain: float, gamma: float, r: int = 16, eta: float = 1e-3,
                 eps: Optional[float] = None) -> torch.Tensor:
     """NOVA-GS ratio brightening after LitaLite's exposure normalisation:

@@ -39,3 +39,18 @@ def test_sh_noise_penalty_grad():
     loss = sh_noise_penalty(pc, cam, nm, torch.ones(N, dtype=torch.bool))
     loss.backward()
     assert abs(float(loss) - 0.1 * 45) < 1e-4 and pc._features_rest.grad is not None
+
+
+def test_reinhard_key_scale_invariant_and_ordering():
+    from halogs.litalite import reinhard_key
+    torch.manual_seed(0)
+    even = [torch.rand(3, 64, 64) * 0.2 + 0.05]                              # evenly lit
+    y = torch.full((3, 64, 64), 0.02); y[:, :8, :8] = 0.6                   # mostly dark, a few bright pixels
+    dark_hc = [y + 0.002 * torch.rand_like(y)]
+    d1, k1, _ = reinhard_key(even, clamp=(0, 1))
+    d2, k2, _ = reinhard_key([im * 0.5 for im in even], clamp=(0, 1))     # capture exposure must not matter
+    assert abs(k1 - k2) / k1 < 0.05
+    d3, k3, _ = reinhard_key(dark_hc, clamp=(0, 1))
+    assert k3 < k1                                                         # mostly-dark high-contrast -> lower key
+    dd, _, _ = reinhard_key(dark_hc)
+    assert 0.25 <= dd <= 0.6

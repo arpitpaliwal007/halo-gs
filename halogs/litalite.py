@@ -319,6 +319,87 @@ def relative_photometric_loss(pred: torch.Tensor, gt: torch.Tensor, lambda_dssim
     return (1 - lambda_dssim) * l1 + lambda_dssim * (1 - ssim_map(pred, gt).mean()), (pred - gt).abs().mean()
 
 
+# ----------------------------------------------------------------------------- NOVA-GS style target
+def _box(x: torch.Tensor, r: int) -> torch.Tensor:
+    """Mean over a (2r+1)^2 window, reflect-padded; x (C,H,W)."""
+    r = int(min(r, (x.shape[-1] - 1), (x.shape[-2] - 1)))
+    if r < 1:
+        return x
+    p = torch.nn.functional.pad(x.unsqueeze(0), (r, r, r, r), mode="reflect")
+    return torch.nn.functional.avg_pool2d(p, 2 * r + 1, stride=1)[0]
+
+
+def guided_filter_self(x: torch.Tensor, r: int = 16, eps: float = 1e-4) -> torch.Tensor:
+    """Self-guided filter (He et al.) of every channel of x (C,H,W): smooth, edge-preserving brightness map."""
+    m = _box(x, r)
+    var = (_box(x * x, r) - m * m).clamp_min(0)
+    a = var / (var + eps)
+    b = m - a * m
+    return _box(a, r) * x + _box(b, r)
+
+
+def noise_sigma(img: torch.Tensor) -> float:
+    """Immerkaer (1996) fast noise std estimate on the channel mean of (3,H,W)."""
+    y = img.mean(0)[None, None]
+    k = torch.tensor([[1., -2., 1.], [-2., 4., -2.], [1., -2., 1.]], dtype=y.dtype, device=y.device)[None, None]
+    H, W = y.shape[-2:]
+    s = torch.nn.functional.conv2d(y, k).abs().sum()
+    return float(s * (3.14159265 / 2) ** 0.5 / (6 * max(W - 2, 1) * max(H - 2, 1)))
+
+
+def nova_maps(img: torch.Tensor, gain: float, r: int = 16, eps: Optional[float] = None) -> torch.Tensor:
+    """Smooth per-channel brightness map of the exposure-normalised image clip(gain * img), in [0, 1]."""
+    x = (img * gain).clamp(0, 1)
+    if eps is None:  # NOVA-GS: eps from the image's noise level (here 4 sigma^2 of the normalised image)
+        eps = max(4.0 * (noise_sigma(img) * gain) ** 2, 1e-5)
+    return guided_filter_self(x, r, eps).clamp(1e-4, 1.0), x
+
+
+def nova_gamma(maps, target_mean: float = 0.5, lo: float = 0.05, hi: float = 3.0, iters: int = 50) -> float:
+    """Binary search (NOVA-GS) for one gamma with mean(L ** gamma) = target_mean over all given maps."""
+    v = torch.cat([m.flatten() for m in maps]).clamp(1e-4, 1)
+    if v.numel() > 2_000_000:
+        v = v[torch.randperm(v.numel(), device=v.device)[:2_000_000]]
+    for _ in range(iters):
+        mid = 0.5 * (lo + hi)
+        if float((v ** mid).mean()) > target_mean:
+            lo = mid
+        else:
+            hi = mid
+    return 0.5 * (lo + hi)
+
+
+def nova_target(img: torch.Tensor, gain: float, gamma: float, r: int = 16, eta: float = 1e-3,
+                eps: Optional[float] = None) -> torch.Tensor:
+    """NOVA-GS ratio brightening after LitaLite's exposure normalisation:
+    x = clip(gain * img), L = guided(x), target = x * L**gamma / (L + eta), hue-safe clip."""
+    L, x = nova_maps(img, gain, r, eps)
+    t = x * (L ** gamma) / (L + eta)
+    peak = t.max(dim=0, keepdim=True).values.clamp_min(1.0)
+    return (t / peak).clamp(0, 1)
+
+
+def gaussian_pixel_coords(pc, cam) -> torch.Tensor:
+    """Projected centres of all Gaussians in NDC (x, y) in [-1, 1] (for grid_sample)."""
+    xyz = pc.get_xyz
+    ph = torch.cat([xyz, torch.ones_like(xyz[:, :1])], 1) @ cam.full_proj_transform
+    return ph[:, :2] / ph[:, 3:4].clamp_min(1e-7)
+
+
+def sh_noise_penalty(pc, cam, noise_map: torch.Tensor, visible: torch.Tensor) -> torch.Tensor:
+    """NOVA-GS noise-guided SH regularisation: each visible Gaussian samples the noise map at its projected
+    centre; the sample weights a penalty on its higher-order SH coefficients (so noise is not stored as
+    view-dependent colour)."""
+    ndc = gaussian_pixel_coords(pc, cam)[visible]
+    if ndc.shape[0] == 0:
+        return noise_map.sum() * 0
+    with torch.no_grad():
+        w = torch.nn.functional.grid_sample(noise_map[None, None], ndc.view(1, 1, -1, 2),
+                                            mode="bilinear", align_corners=False).view(-1)
+    rest = pc._features_rest[visible]
+    return (w * rest.pow(2).flatten(1).sum(1)).mean()
+
+
 def pseudo_weight(it: int, start: int, end: int) -> float:
     """Pseudo-target weight multiplier: 1 until ``start``, linear to 0 at ``end`` (end<=0: never fades)."""
     if end <= 0 or it <= start:

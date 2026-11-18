@@ -43,7 +43,7 @@ from utils.general_utils import safe_state  # noqa: E402
 
 from halogs.gaussians import EmissiveGaussianModel  # noqa: E402
 from halogs.halo import HaloModel, focal_px_from_camera, render_halo  # noqa: E402
-from halogs.litalite import apply_luma_curve, he_curve, illum_prior_loss, relative_photometric_loss, spatial_consistency_loss, ColourCurveCamera, ToneCurve, bilateral, colour_constancy_loss, exposure_loss, pseudo_weight, brighten_target, grayworld_gains, illum_init_from, render_litalite, scene_gain  # noqa: E402
+from halogs.litalite import nova_maps, nova_gamma, nova_target, sh_noise_penalty, apply_luma_curve, he_curve, illum_prior_loss, relative_photometric_loss, spatial_consistency_loss, ColourCurveCamera, ToneCurve, bilateral, colour_constancy_loss, exposure_loss, pseudo_weight, brighten_target, grayworld_gains, illum_init_from, render_litalite, scene_gain  # noqa: E402
 from halogs.losses import emission_sparsity, glow_tv, photometric_loss  # noqa: E402
 from halogs.masks import glow_mask  # noqa: E402
 from halogs.metrics import all_metrics  # noqa: E402
@@ -111,7 +111,10 @@ def add_halo_args(p: argparse.ArgumentParser) -> None:
                    help="dark-branch camera model: power = g*x^gamma (same as --tone_curve); "
                         "colour_curve = per-view 3x3 colour matrix + knot curve tied to a global curve")
     g.add_argument("--cam_knots", type=int, default=16)
-    g.add_argument("--target_curve", choices=["linear", "he"], default="linear",
+    g.add_argument("--nova_mean", type=float, default=0.5, help="NOVA-GS target exposure for the gamma binary search")
+    g.add_argument("--nova_radius", type=int, default=16, help="guided-filter radius (16 -> 33x33 window, as NOVA-GS)")
+    g.add_argument("--w_sh_noise", type=float, default=0.0, help="NOVA-GS noise-guided penalty on higher-order SH")
+    g.add_argument("--target_curve", choices=["linear", "he", "nova"], default="linear",
                    help="he = scene luminance curve 0.5*HE-CDF + 0.5*linear gain from the training dark images (Luminance-GS prior)")
     g.add_argument("--he_blend", type=float, default=0.5)
     g.add_argument("--w_spa", type=float, default=0.0, help="Zero-DCE/Luminance-GS spatial consistency (bright vs dark input)")
@@ -231,12 +234,42 @@ def main():
               f"y(0.05)={float(he_lut[13]):.3f} y(0.1)={float(he_lut[26]):.3f} y(0.2)={float(he_lut[51]):.3f}")
         torch.save(he_lut, os.path.join(dataset.model_path, "he_lut.pt"))
 
+    nova_g = None
+    noise_cache = {}
+
+    def _src(gt):
+        if n2n_net is not None:
+            return (n2n_apply(n2n_net, (gt * n2n_s).clamp(0, 1)) / n2n_s).clamp(0, 1)
+        return gt
+
+    def _gain(img):
+        return target_gain if target_gain is not None else args.theta / float(img.mean().clamp_min(1e-4))
+
+    if lit and args.target_curve == "nova":
+        with torch.no_grad():
+            maps = []
+            for c in train_cams:  # training views only
+                im = _src(c.original_image.to(device))
+                maps.append(nova_maps(im, _gain(im), args.nova_radius)[0])
+            nova_g = nova_gamma(maps, args.nova_mean)
+            del maps
+        print(f"[litalite] NOVA-GS target: exposure-normalised (theta {args.theta}), guided filter r={args.nova_radius}, "
+              f"gamma by binary search to mean {args.nova_mean} -> gamma = {nova_g:.4f}")
+        with open(os.path.join(dataset.model_path, "nova_gamma.txt"), "w") as f:
+            f.write(f"{nova_g}\n")
+
     def lit_target(cam, gt):
         if cam.image_name not in target_cache:
             src = gt
             if n2n_net is not None:  # denoise the dark photo at a mid-grey scale, then brighten as usual
                 src = (n2n_apply(n2n_net, (gt * n2n_s).clamp(0, 1)) / n2n_s).clamp(0, 1)
-            if he_lut is not None:
+            if nova_g is not None:
+                with torch.no_grad():
+                    t = nova_target(src, _gain(src), nova_g, args.nova_radius)
+                    if args.w_sh_noise > 0:  # noise map = |enhanced raw - enhanced denoised|, channel mean
+                        t_raw = nova_target(gt, _gain(src), nova_g, args.nova_radius)
+                        noise_cache[cam.image_name] = (t_raw - t).abs().mean(0)
+            elif he_lut is not None:
                 t = apply_luma_curve(src, he_lut)
             else:
                 t = brighten_target(src, args.theta, target_gain, hue_safe=not args.legacy_clip,
@@ -330,6 +363,9 @@ def main():
                     loss = loss + args.w_col * colour_constancy_loss(pkg["bright"])
             if args.w_spa > 0:
                 loss = loss + args.w_spa * spatial_consistency_loss(pkg["bright"], gt)
+            if args.w_sh_noise > 0 and cam.image_name in noise_cache:
+                loss = loss + args.w_sh_noise * sh_noise_penalty(gaussians, cam, noise_cache[cam.image_name],
+                                                                 pkg["visibility_filter"])
             if args.w_ill > 0:
                 loss = loss + args.w_ill * illum_prior_loss(pkg["illum_map"], gt, target, args.ill_smooth)
             if isinstance(tone, ColourCurveCamera) and args.w_tie > 0:

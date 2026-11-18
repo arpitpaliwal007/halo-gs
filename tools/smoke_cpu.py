@@ -204,6 +204,7 @@ def main():
         if run == "litalite_unet":
             sys.argv += ["--illum_channels", "3", "--cam_model", "colour_curve", "--cam_knots", "8",
                          "--w_expo", "0.5", "--w_col", "0.05", "--prior_from", "5", "--pseudo_fade", "10", "40",
+                         "--target_curve", "he", "--w_spa", "1.0", "--w_ill", "0.1", "--rel_l1",
                          "--denoise_target", "n2n_unet",
                          "--n2n_iters", "3", "--n2n_crop", "16", "--n2n_batch", "2", "--n2n_width", "8"]
         train_glow.main()

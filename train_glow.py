@@ -43,7 +43,7 @@ from utils.general_utils import safe_state  # noqa: E402
 
 from halogs.gaussians import EmissiveGaussianModel  # noqa: E402
 from halogs.halo import HaloModel, focal_px_from_camera, render_halo  # noqa: E402
-from halogs.litalite import ColourCurveCamera, ToneCurve, bilateral, colour_constancy_loss, exposure_loss, pseudo_weight, brighten_target, grayworld_gains, illum_init_from, render_litalite, scene_gain  # noqa: E402
+from halogs.litalite import apply_luma_curve, he_curve, illum_prior_loss, relative_photometric_loss, spatial_consistency_loss, ColourCurveCamera, ToneCurve, bilateral, colour_constancy_loss, exposure_loss, pseudo_weight, brighten_target, grayworld_gains, illum_init_from, render_litalite, scene_gain  # noqa: E402
 from halogs.losses import emission_sparsity, glow_tv, photometric_loss  # noqa: E402
 from halogs.masks import glow_mask  # noqa: E402
 from halogs.metrics import all_metrics  # noqa: E402
@@ -111,6 +111,13 @@ def add_halo_args(p: argparse.ArgumentParser) -> None:
                    help="dark-branch camera model: power = g*x^gamma (same as --tone_curve); "
                         "colour_curve = per-view 3x3 colour matrix + knot curve tied to a global curve")
     g.add_argument("--cam_knots", type=int, default=16)
+    g.add_argument("--target_curve", choices=["linear", "he"], default="linear",
+                   help="he = scene luminance curve 0.5*HE-CDF + 0.5*linear gain from the training dark images (Luminance-GS prior)")
+    g.add_argument("--he_blend", type=float, default=0.5)
+    g.add_argument("--w_spa", type=float, default=0.0, help="Zero-DCE/Luminance-GS spatial consistency (bright vs dark input)")
+    g.add_argument("--w_ill", type=float, default=0.0, help="LL-Gaussian max-channel illumination prior (extra render pass)")
+    g.add_argument("--ill_smooth", type=float, default=0.001, help="edge-aware smoothness inside the illumination prior")
+    g.add_argument("--rel_l1", action="store_true", help="LL-Gaussian brightness-relative L1 on the dark reconstruction")
     g.add_argument("--w_tie", type=float, default=0.01, help="tie per-view colour/curve to identity/global")
     g.add_argument("--w_expo", type=float, default=0.0, help="Zero-DCE exposure loss on the bright render")
     g.add_argument("--expo_target", type=float, default=0.6)
@@ -214,13 +221,26 @@ def main():
               f"{'' if wb_gains is None else ' gains R/G/B ' + str([round(float(v), 3) for v in wb_gains])}"
               f"  target gamma={args.target_gamma}")
 
+    he_lut = None
+    if lit and args.target_curve == "he":
+        dn = None
+        if n2n_net is not None:
+            dn = lambda im: (n2n_apply(n2n_net, (im.to(device) * n2n_s).clamp(0, 1)) / n2n_s).clamp(0, 1)
+        he_lut = he_curve(train_cams, args.theta, args.he_blend, denoise=dn)
+        print(f"[litalite] HE target curve (blend {args.he_blend}): y(0.02)={float(he_lut[5]):.3f} "
+              f"y(0.05)={float(he_lut[13]):.3f} y(0.1)={float(he_lut[26]):.3f} y(0.2)={float(he_lut[51]):.3f}")
+        torch.save(he_lut, os.path.join(dataset.model_path, "he_lut.pt"))
+
     def lit_target(cam, gt):
         if cam.image_name not in target_cache:
             src = gt
             if n2n_net is not None:  # denoise the dark photo at a mid-grey scale, then brighten as usual
                 src = (n2n_apply(n2n_net, (gt * n2n_s).clamp(0, 1)) / n2n_s).clamp(0, 1)
-            t = brighten_target(src, args.theta, target_gain, hue_safe=not args.legacy_clip,
-                                wb_gains=wb_gains, gamma=args.target_gamma)
+            if he_lut is not None:
+                t = apply_luma_curve(src, he_lut)
+            else:
+                t = brighten_target(src, args.theta, target_gain, hue_safe=not args.legacy_clip,
+                                    wb_gains=wb_gains, gamma=args.target_gamma)
             if args.denoise_target == "bilateral":
                 with torch.no_grad():
                     t = bilateral(t, args.dn_radius, args.dn_sigma_s, args.dn_sigma_r)
@@ -291,10 +311,14 @@ def main():
         gt = cam.original_image.to(device)
         l_exp = l_rec = None
         if lit:
-            pkg = render_litalite(render, cam, gaussians, pipe, bg, halo, use_glow=use_glow, tone=tone)
+            pkg = render_litalite(render, cam, gaussians, pipe, bg, halo, use_glow=use_glow, tone=tone,
+                                  illum_map=args.w_ill > 0)
             target = lit_target(cam, gt)
             l_exp, _ = photometric_loss(pkg["bright"], target, opt.lambda_dssim)
-            l_rec, l1 = photometric_loss(pkg["render"], gt, opt.lambda_dssim)
+            if args.rel_l1:
+                l_rec, l1 = relative_photometric_loss(pkg["render"], gt, opt.lambda_dssim)
+            else:
+                l_rec, l1 = photometric_loss(pkg["render"], gt, opt.lambda_dssim)
             w_ps = args.w_exp * pseudo_weight(iteration, *args.pseudo_fade)
             loss = w_ps * l_exp + args.w_rec * l_rec
             if args.w_tv > 0:
@@ -304,6 +328,10 @@ def main():
                     loss = loss + args.w_expo * exposure_loss(pkg["bright"], args.expo_target, args.expo_patch)
                 if args.w_col > 0:
                     loss = loss + args.w_col * colour_constancy_loss(pkg["bright"])
+            if args.w_spa > 0:
+                loss = loss + args.w_spa * spatial_consistency_loss(pkg["bright"], gt)
+            if args.w_ill > 0:
+                loss = loss + args.w_ill * illum_prior_loss(pkg["illum_map"], gt, target, args.ill_smooth)
             if isinstance(tone, ColourCurveCamera) and args.w_tie > 0:
                 loss = loss + args.w_tie * tone.tie_loss()
         else:

@@ -229,6 +229,96 @@ def colour_constancy_loss(img: torch.Tensor) -> torch.Tensor:
     return (r - g).pow(2) + (r - b).pow(2) + (g - b).pow(2)
 
 
+def he_curve(cams, theta: float = 0.40, blend: float = 0.5, bins: int = 256, smooth: int = 5,
+             denoise=None) -> torch.Tensor:
+    """Scene-wide luminance tone curve (LUT of ``bins`` values) from the *training* dark images only.
+
+    Luminance-GS initialises its curve from the CDF of the histogram-equalised input; plain HE
+    over-flattens, so the LUT is ``blend * CDF + (1 - blend) * linear``, where linear is the
+    original LitaLite gain curve min(g x, 1) with g = theta / mean.  ``blend`` is fixed a priori
+    (0.5), it is never tuned on a reference.  Monotone by construction, 0 -> 0.
+    """
+    with torch.no_grad():
+        ys = []
+        for c in cams:
+            im = c.original_image.float()
+            if denoise is not None:
+                im = denoise(im)
+            ys.append(im.mean(0).flatten())
+        y = torch.cat(ys).clamp(0, 1).cpu()
+        h = torch.histc(y, bins=bins, min=0.0, max=1.0)
+        if smooth > 1:
+            k = torch.ones(1, 1, smooth) / smooth
+            h = torch.nn.functional.conv1d(h.view(1, 1, -1), k, padding=smooth // 2).view(-1)[:bins]
+        cdf = torch.cumsum(h, 0)
+        cdf = torch.cat([torch.zeros(1), cdf / cdf[-1].clamp_min(1e-8)])   # bins+1 knots on [0,1]
+        x = torch.linspace(0, 1, bins + 1)
+        lin = (x * theta / float(y.mean().clamp_min(1e-4))).clamp(0, 1)
+        return (blend * cdf + (1 - blend) * lin).clamp(0, 1)
+
+
+def apply_luma_curve(img: torch.Tensor, lut: torch.Tensor) -> torch.Tensor:
+    """Brighten (3,H,W) by a luminance LUT, scaling R,G,B by the same factor (hue preserved), hue-safe clip."""
+    lut = lut.to(img)
+    K = lut.numel() - 1
+    y = img.mean(0, keepdim=True).clamp(0, 1)
+    u = y * K
+    i = u.floor().clamp(max=K - 1).long()
+    f = u - i.to(u.dtype)
+    yo = lut[i] * (1 - f) + lut[i + 1] * f
+    t = img * (yo / y.clamp_min(1e-4))
+    peak = t.max(dim=0, keepdim=True).values.clamp_min(1.0)
+    return (t / peak).clamp(0, 1)
+
+
+def spatial_consistency_loss(out: torch.Tensor, inp: torch.Tensor, patch: int = 4) -> torch.Tensor:
+    """Zero-DCE spatial consistency with Luminance-GS's adaptive scale 0.5 / mean(input).
+
+    The 4-neighbour luminance differences of the (patch-pooled) output must match those of the
+    input, scaled up by 0.5 / mean(input), so local structure is kept while brightening.
+    """
+    def pooled(x):
+        return torch.nn.functional.avg_pool2d(x.mean(0, keepdim=True).unsqueeze(0), patch, patch)[0, 0]
+    po, pi = pooled(out), pooled(inp) * (0.5 / float(inp.mean().clamp_min(1e-4)))
+    loss = 0.0
+    for dy, dx in ((0, 1), (1, 0)):
+        do = po[dy:, dx:] - po[:po.shape[0] - dy, :po.shape[1] - dx]
+        di = pi[dy:, dx:] - pi[:pi.shape[0] - dy, :pi.shape[1] - dx]
+        loss = loss + (do.abs() - di.abs()).pow(2).mean()
+    return loss
+
+
+def illum_prior_loss(illum_map: torch.Tensor, dark: torch.Tensor, target: torch.Tensor,
+                     w_smooth: float = 0.001) -> torch.Tensor:
+    """LL-Gaussian max-channel illumination prior, adapted to dark = R * L with R ~ bright target.
+
+    LL-Gaussian ties S to max_c(I) (Retinex with max_c R = 1).  Here the bright output is R, so the
+    consistent max-channel target is max_c(I) / max_c(T): the per-pixel darkening between the
+    brightened target and the photo.  Plus an edge-aware smoothness so L cannot carry texture.
+    """
+    s = illum_map.max(0, keepdim=True).values
+    tgt = (dark.max(0, keepdim=True).values / target.max(0, keepdim=True).values.clamp_min(1e-3)).clamp(0, 1)
+    loss = (s - tgt.detach()).abs().mean()
+    if w_smooth > 0:
+        g = dark.mean(0, keepdim=True)
+        wx = torch.exp(-10 * (g[:, :, 1:] - g[:, :, :-1]).abs())
+        wy = torch.exp(-10 * (g[:, 1:] - g[:, :-1]).abs())
+        loss = loss + w_smooth * ((wx * (s[:, :, 1:] - s[:, :, :-1]).abs()).mean()
+                                  + (wy * (s[:, 1:] - s[:, :-1]).abs()).mean())
+    return loss
+
+
+def relative_photometric_loss(pred: torch.Tensor, gt: torch.Tensor, lambda_dssim: float = 0.2,
+                              eps: float = 0.01):
+    """LL-Gaussian brightness-relative L1: |pred - gt| / (sg(pred) + eps), renormalised to mean weight 1
+    (so the loss scale matches plain L1), + D-SSIM.  Dark regions count as much as bright ones."""
+    from .losses import ssim_map
+    w = 1.0 / (pred.detach() + eps)
+    w = w / w.mean()
+    l1 = (w * (pred - gt).abs()).mean()
+    return (1 - lambda_dssim) * l1 + lambda_dssim * (1 - ssim_map(pred, gt).mean()), (pred - gt).abs().mean()
+
+
 def pseudo_weight(it: int, start: int, end: int) -> float:
     """Pseudo-target weight multiplier: 1 until ``start``, linear to 0 at ``end`` (end<=0: never fades)."""
     if end <= 0 or it <= start:
@@ -261,7 +351,7 @@ def bilateral(img: torch.Tensor, radius: int = 2, sigma_s: float = 1.5, sigma_r:
 
 def render_litalite(render_fn, cam, pc, pipe, bg_color: torch.Tensor, halo: Optional[HaloModel] = None,
                     use_glow: bool = False, clamp: bool = True,
-                    tone: Optional["ToneCurve"] = None) -> dict:
+                    tone: Optional["ToneCurve"] = None, illum_map: bool = False) -> dict:
     """Bright (reflectance) render, dark render (reflectance * illumination) and optional glow.
 
     Returned keys:
@@ -282,6 +372,10 @@ def render_litalite(render_fn, cam, pc, pipe, bg_color: torch.Tensor, halo: Opti
            "dense": [(b["viewspace_points"], b["visibility_filter"], b["radii"]),
                      (d["viewspace_points"], d["visibility_filter"], d["radii"])]}
     name = getattr(cam, "image_name", None)
+    if illum_map:  # rendered illumination G(L) on black, for the illumination prior
+        L = pc.get_illum
+        L = L.expand(-1, 3) if L.shape[1] == 1 else L
+        out["illum_map"] = render_fn(cam, pc, pipe, torch.zeros_like(bg_color), override_color=L, **kw)["render"]
     if use_glow and halo is not None:
         black = torch.zeros_like(bg_color)
         e = render_fn(cam, pc, pipe, black, override_color=pc.get_emission, **kw)["render"]

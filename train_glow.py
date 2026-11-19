@@ -43,7 +43,7 @@ from utils.general_utils import safe_state  # noqa: E402
 
 from halogs.gaussians import EmissiveGaussianModel  # noqa: E402
 from halogs.halo import HaloModel, focal_px_from_camera, render_halo  # noqa: E402
-from halogs.litalite import MonoDepth, pearson_depth_loss, exposure_factor_for_mean, white_patch_mean, Relight3D, fit_relight_gamma, illum_knn_smooth, illum_white_point, white_patch_loss, reinhard_key, guided_filter_self, noise_sigma, nova_maps, nova_gamma, nova_target, sh_noise_penalty, apply_luma_curve, he_curve, illum_prior_loss, relative_photometric_loss, spatial_consistency_loss, ColourCurveCamera, ToneCurve, bilateral, colour_constancy_loss, exposure_loss, pseudo_weight, brighten_target, grayworld_gains, illum_init_from, render_litalite, scene_gain  # noqa: E402
+from halogs.litalite import MonoDepth, pearson_depth_loss, exposure_factor_for_mean, white_patch_mean, Relight3D, fit_relight_gamma, illum_knn_smooth, illum_white_point, finite_report, white_patch_loss, reinhard_key, guided_filter_self, noise_sigma, nova_maps, nova_gamma, nova_target, sh_noise_penalty, apply_luma_curve, he_curve, illum_prior_loss, relative_photometric_loss, spatial_consistency_loss, ColourCurveCamera, ToneCurve, bilateral, colour_constancy_loss, exposure_loss, pseudo_weight, brighten_target, grayworld_gains, illum_init_from, render_litalite, scene_gain  # noqa: E402
 from halogs.losses import emission_sparsity, glow_tv, photometric_loss  # noqa: E402
 from halogs.masks import glow_mask  # noqa: E402
 from halogs.metrics import all_metrics  # noqa: E402
@@ -125,6 +125,9 @@ def add_halo_args(p: argparse.ArgumentParser) -> None:
     g.add_argument("--w_anchor", type=float, default=0.1, help="weight of the 2D pseudo-target once relighting is on")
     g.add_argument("--w_lsmooth", type=float, default=1.0, help="3D kNN smoothness of illumination (relighting phase)")
     g.add_argument("--w_wp", type=float, default=0.1, help="white-patch Retinex on reflectance (relighting phase)")
+    g.add_argument("--debug_sync", type=int, default=0,
+                   help="synchronise CUDA after every loss term for this many iterations after relight_from "
+                        "(pinpoints a device-side error without CUDA_LAUNCH_BLOCKING for the whole run)")
     g.add_argument("--nova_mean_rule", choices=["fixed", "reinhard", "whitepatch_exposure"], default="fixed",
                    help="reinhard = scene-adaptive target exposure from Reinhard (2002) automatic key estimation "
                         "on the training dark images (replaces --nova_mean)")
@@ -409,7 +412,7 @@ def main():
             fit_cams = [train_cams[i] for i in range(0, len(train_cams), max(1, len(train_cams) // 3))][:3]
             g_r = fit_relight_gamma(render, fit_cams, gaussians, pipe, bg, k, args.relight_mean)
             relight = Relight3D(k, g_r)
-            print(f"\n[relight3d] iter {iteration}: k {k:.2f}  gamma {g_r:.3f}")
+            print(f"\n[relight3d] iter {iteration}: k {k:.2f}  gamma {g_r:.3f}  {finite_report(gaussians)}", flush=True)
         if iteration % 1000 == 0:
             gaussians.oneupSHdegree()
 
@@ -447,11 +450,20 @@ def main():
                 loss = loss + args.w_ill * illum_prior_loss(pkg["illum_map"], gt, target, args.ill_smooth)
             if args.w_depth > 0 and pkg.get("depth") is not None and cam.image_name in mono_cache:
                 loss = loss + args.w_depth * pearson_depth_loss(pkg["depth"], mono_cache[cam.image_name])
+            dbg = relit and iteration <= args.relight_from + args.debug_sync
+
+            def _sync(tag):
+                if dbg:
+                    print(f"[debug {iteration}] {tag}", flush=True)
+                    torch.cuda.synchronize() if torch.cuda.is_available() else None
+            _sync("render + target + depth ok")
             if relit:
                 if args.w_lsmooth > 0:
                     loss = loss + args.w_lsmooth * illum_knn_smooth(gaussians)
+                    _sync("illum_knn_smooth ok")
                 if args.w_wp > 0:
                     loss = loss + args.w_wp * white_patch_loss(gaussians, cam, pkg["visibility_filter"])
+                    _sync("white_patch_loss ok")
             if isinstance(tone, ColourCurveCamera) and args.w_tie > 0:
                 loss = loss + args.w_tie * tone.tie_loss()
         else:
@@ -463,6 +475,9 @@ def main():
             if args.lambda_glow_tv > 0:
                 loss = loss + args.lambda_glow_tv * glow_tv(pkg["glow"])
         loss.backward()
+        if lit and dbg:
+            torch.cuda.synchronize() if torch.cuda.is_available() else None
+            print(f"[debug {iteration}] backward ok", flush=True)
 
         with torch.no_grad():
             ema_loss = 0.4 * loss.item() + 0.6 * ema_loss

@@ -40,3 +40,19 @@ def test_fit_gamma_hits_target(monkeypatch):
     g = fit_relight_gamma(fake_render, [None, None], pc, None, None, k, target_mean=0.5)
     m = float((refl * Relight3D(k, g).T(pc.get_illum)).mean())
     assert abs(m - 0.5) < 0.01
+
+
+def test_knn_smooth_and_white_patch_survive_nonfinite():
+    import torch
+    from types import SimpleNamespace
+    from halogs.litalite import illum_knn_smooth, finite_report
+    torch.manual_seed(0)
+    xyz = torch.randn(500, 3)
+    xyz[:20] = float("nan"); xyz[20:25] = 1e30          # NaN and far floaters
+    L = torch.rand(500, 3, requires_grad=True)
+    pc = SimpleNamespace(get_xyz=xyz, get_illum=L, get_features=torch.zeros(500, 1, 3))
+    loss = illum_knn_smooth(pc, n_anchor=64, n_pool=256)
+    assert torch.isfinite(loss)
+    loss.backward()
+    assert torch.isfinite(L.grad).all()
+    assert "bad_xyz=25" in finite_report(pc) or "bad_xyz=20" in finite_report(pc)

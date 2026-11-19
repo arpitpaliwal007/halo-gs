@@ -603,34 +603,59 @@ def fit_relight_gamma(render_fn, cams, pc, pipe, bg, k: float, target_mean: floa
 
 def illum_knn_smooth(pc, n_anchor: int = 2048, n_pool: int = 16384) -> torch.Tensor:
     """3D smoothness of illumination: random anchor Gaussians vs their 8 nearest neighbours in a random pool,
-    weighted by exp(-d^2 / s^2) with s the median neighbour distance (no edge cases with few Gaussians)."""
-    N = pc.get_xyz.shape[0]
+    weighted by exp(-d^2 / s^2) with s the median neighbour distance.
+
+    Defensive (the shrub crash at the start of phase 2): only Gaussians with finite position and illumination
+    are sampled, positions are centred before the distance matrix (no overflow from far floaters), non-finite
+    distances are replaced by a huge value before topk (topk on NaN can return invalid indices on CUDA), and
+    the neighbour indices are clamped into range."""
+    xyz, L = pc.get_xyz, pc.get_illum
+    ok = torch.isfinite(xyz).all(1) & torch.isfinite(L).all(1)
+    idx = ok.nonzero(as_tuple=False).squeeze(1)
+    N = idx.numel()
     if N < 16:
-        return pc.get_illum.sum() * 0
-    dev = pc.get_xyz.device
-    ia = torch.randint(0, N, (min(n_anchor, N),), device=dev)
-    ip = torch.randint(0, N, (min(n_pool, N),), device=dev)
-    xa, xp = pc.get_xyz[ia].detach(), pc.get_xyz[ip].detach()
-    d2 = torch.cdist(xa, xp) ** 2
-    k = min(9, xp.shape[0])
-    dk, jk = d2.topk(k, dim=1, largest=False)
-    dk, jk = dk[:, 1:], jk[:, 1:]                       # drop a possible self-match
-    s2 = dk.median().clamp_min(1e-12)
-    w = torch.exp(-dk / s2)
-    L = pc.get_illum
-    diff = (L[ia][:, None, :] - L[ip][jk]).abs().mean(-1)
-    return (w * diff).sum() / w.sum().clamp_min(1e-8)
+        return L.sum() * 0
+    dev = xyz.device
+    ia = idx[torch.randint(0, N, (min(n_anchor, N),), device=dev)]
+    ip = idx[torch.randint(0, N, (min(n_pool, N),), device=dev)]
+    with torch.no_grad():
+        c = xyz[idx].median(0, keepdim=True).values      # median: robust to far floaters
+        xa, xp = xyz[ia] - c, xyz[ip] - c
+        d2 = torch.cdist(xa, xp) ** 2
+        d2 = torch.nan_to_num(d2, nan=1e30, posinf=1e30, neginf=1e30)
+        k = min(9, xp.shape[0])
+        dk, jk = d2.topk(k, dim=1, largest=False)
+        dk, jk = dk[:, 1:], jk[:, 1:].clamp(0, xp.shape[0] - 1)   # drop a possible self-match
+        good = dk < 1e29
+        s2 = dk[good].median().clamp_min(1e-12) if bool(good.any()) else torch.ones((), device=dev)
+        w = torch.exp(-dk / s2) * good
+    diff = (L[ia][:, None, :] - L[ip[jk]]).abs().mean(-1)
+    return (w * diff).sum() / w.sum().clamp_min(1e-8)   # all neighbours bad -> w = 0 -> loss 0 (with grad)
 
 
 def white_patch_loss(pc, cam, visible: torch.Tensor, q: float = 0.99) -> torch.Tensor:
-    """White-patch Retinex on reflectance: the q-th percentile of max_c R over visible Gaussians should be 1."""
-    r = reflectance_colours(pc, cam)[visible]
-    if r.shape[0] < 10:
-        return r.sum() * 0
+    """White-patch Retinex on reflectance: the q-th percentile of max_c R over visible Gaussians should be 1.
+    Defensive: a visibility mask of the wrong length is ignored, non-finite values are dropped."""
+    r = reflectance_colours(pc, cam)
+    if visible is not None and visible.dtype == torch.bool and visible.shape[0] == r.shape[0]:
+        r = r[visible]
     m = r.max(1).values
+    m = m[torch.isfinite(m)]
+    if m.numel() < 10:
+        return r.sum() * 0
     if m.numel() > 500_000:
         m = m[torch.randperm(m.numel(), device=m.device)[:500_000]]
     return (1.0 - torch.quantile(m, q)).clamp_min(0) ** 2
+
+
+def finite_report(pc) -> str:
+    """Counts of Gaussians with non-finite position / illumination / features (diagnostics)."""
+    with torch.no_grad():
+        n = pc.get_xyz.shape[0]
+        bx = int((~torch.isfinite(pc.get_xyz).all(1)).sum())
+        bl = int((~torch.isfinite(pc.get_illum).all(1)).sum())
+        bf = int((~torch.isfinite(pc.get_features.flatten(1)).all(1)).sum())
+        return f"N={n} bad_xyz={bx} bad_illum={bl} bad_sh={bf}"
 
 
 def render_litalite(render_fn, cam, pc, pipe, bg_color: torch.Tensor, halo: Optional[HaloModel] = None,

@@ -117,7 +117,11 @@ def add_halo_args(p: argparse.ArgumentParser) -> None:
     g.add_argument("--depth_model", default="depth-anything/Depth-Anything-V2-Small-hf",
                    help="Hugging Face depth-estimation model, or 'fake' for offline tests")
     g.add_argument("--relight3d", action="store_true",
-                   help="Idea A: enhanced output = splat(R * T(L)), T = clamp(k L)^gamma on the learned 3D illumination")
+                   help="A1 phase 2 from --relight_from: 2D target weight -> --w_anchor, + 3D kNN illumination smoothness "
+                        "+ white-patch on reflectance.  Output stays splat(R).")
+    g.add_argument("--relight_curve", action="store_true",
+                   help="legacy (v6 buu/shrub runs): also relight the output, splat(R * T(L)), T = clamp(k L)^gamma "
+                        "(gamma always hit its 0.05 floor, so the curve is not part of the method)")
     g.add_argument("--relight_from", type=int, default=5000, help="iterations of plain v5 (bright = R) before relighting")
     g.add_argument("--relight_every", type=int, default=1000, help="re-estimate k and gamma every N iterations")
     g.add_argument("--relight_mean", type=float, default=0.5, help="target mean brightness of the relit output")
@@ -407,7 +411,9 @@ def main():
     for iteration in range(1, opt.iterations + 1):
         gaussians.update_learning_rate(iteration)
         relit = lit and args.relight3d and iteration > args.relight_from
-        if relit and (relight is None or iteration % args.relight_every == 0):
+        if relit and not args.relight_curve and (iteration == args.relight_from + 1 or iteration % 1000 == 0):
+            print(f"\n[A1] iter {iteration}: {finite_report(gaussians)}", flush=True)
+        if relit and args.relight_curve and (relight is None or iteration % args.relight_every == 0):
             k = illum_white_point(gaussians, args.relight_q)
             fit_cams = [train_cams[i] for i in range(0, len(train_cams), max(1, len(train_cams) // 3))][:3]
             g_r = fit_relight_gamma(render, fit_cams, gaussians, pipe, bg, k, args.relight_mean)

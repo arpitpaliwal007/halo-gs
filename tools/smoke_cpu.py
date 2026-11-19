@@ -187,8 +187,8 @@ def main():
 
     import train_glow, render_glow, eval_glow  # noqa: E402  (after patches)
 
-    for run in ("halo", "masked", "vanilla", "litalite", "litalite_halo", "litalite_plus", "litalite_unet", "litalite_nodn", "litalite_relight"):
-        mode = "litalite" if run in ("litalite_plus", "litalite_unet", "litalite_nodn", "litalite_relight") else run
+    for run in ("halo", "masked", "vanilla", "litalite", "litalite_halo", "litalite_plus", "litalite_unet", "litalite_nodn", "litalite_relight", "litalite_v7"):
+        mode = "litalite" if run in ("litalite_plus", "litalite_unet", "litalite_nodn", "litalite_relight", "litalite_v7") else run
         out = os.path.join(work, "out", "tiny", run)
         sys.argv = ["train_glow.py", "-s", scene, "-m", out, "--mode", mode, "--iterations", str(args.iters),
                     "--densify_from_iter", "10", "--densification_interval", "20", "--densify_until_iter", str(args.iters),
@@ -212,6 +212,11 @@ def main():
                          "--denoise_target", "n2n_unet", "--n2n_iters", "3", "--n2n_crop", "16", "--n2n_batch", "2", "--n2n_width", "8",
                          "--relight3d", "--relight_from", "20", "--relight_every", "20", "--w_anchor", "0.1",
                          "--nova_mean_rule", "whitepatch_exposure", "--w_depth", "0.05", "--depth_model", "fake"]
+        if run == "litalite_v7":  # v7 = v4 (gamma target + spatial + illumination prior + relative L1) + depth, no SH penalty
+            sys.argv += ["--illum_channels", "3", "--target_curve", "nova", "--nova_mean", "0.5", "--nova_radius", "4",
+                         "--denoise_target", "n2n_unet", "--n2n_iters", "3", "--n2n_crop", "16", "--n2n_batch", "2", "--n2n_width", "8",
+                         "--w_spa", "1.0", "--w_ill", "1.0", "--ill_smooth", "0.001", "--rel_l1",
+                         "--w_depth", "0.05", "--depth_model", "fake"]
         if run == "litalite_nodn":  # v4 without the denoiser: SH penalty uses the guided-filter noise map
             sys.argv += ["--illum_channels", "3", "--target_curve", "nova", "--nova_radius", "4", "--w_sh_noise", "1.0",
                          "--sh_noise_src", "guided", "--denoise_target", "none", "--dump_targets", "2", "--nova_mean_rule", "reinhard"]

@@ -208,9 +208,10 @@ def main():
                          "--denoise_target", "n2n_unet",
                          "--n2n_iters", "3", "--n2n_crop", "16", "--n2n_batch", "2", "--n2n_width", "8", "--dump_targets", "2"]
         if run == "litalite_relight":  # Idea A: 3D relighting of the learned illumination field
-            sys.argv += ["--illum_channels", "3", "--target_curve", "nova", "--nova_radius", "4", "--w_sh_noise", "1.0",
+            sys.argv += ["--illum_channels", "3", "--target_curve", "nova", "--nova_radius", "4",
                          "--denoise_target", "n2n_unet", "--n2n_iters", "3", "--n2n_crop", "16", "--n2n_batch", "2", "--n2n_width", "8",
-                         "--relight3d", "--relight_from", "20", "--relight_every", "20", "--w_anchor", "0.1"]
+                         "--relight3d", "--relight_from", "20", "--relight_every", "20", "--w_anchor", "0.1",
+                         "--nova_mean_rule", "whitepatch_exposure", "--w_depth", "0.05", "--depth_model", "fake"]
         if run == "litalite_nodn":  # v4 without the denoiser: SH penalty uses the guided-filter noise map
             sys.argv += ["--illum_channels", "3", "--target_curve", "nova", "--nova_radius", "4", "--w_sh_noise", "1.0",
                          "--sh_noise_src", "guided", "--denoise_target", "none", "--dump_targets", "2", "--nova_mean_rule", "reinhard"]

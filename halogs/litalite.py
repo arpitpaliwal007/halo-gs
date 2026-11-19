@@ -398,13 +398,97 @@ def reinhard_key(images, lo_pct: float = 1.0, hi_pct: float = 99.0, display_gamm
 
 
 def nova_target(img: torch.Tensor, gain: float, gamma: float, r: int = 16, eta: float = 1e-3,
-                eps: Optional[float] = None) -> torch.Tensor:
-    """NOVA-GS ratio brightening after LitaLite's exposure normalisation:
-    x = clip(gain * img), L = guided(x), target = x * L**gamma / (L + eta), hue-safe clip."""
+                eps: Optional[float] = None, scale: float = 1.0) -> torch.Tensor:
+    """Retinex illumination-gamma target (LIME family; NOVA-GS form) after LitaLite's exposure normalisation:
+    x = clip(gain * img), L = guided(x), target = scale * x * L**gamma / (L + eta), hue-safe clip.
+    ``scale`` is a scene-level exposure factor (see :func:`exposure_factor_for_mean`); 1 = NOVA-GS / v5."""
     L, x = nova_maps(img, gain, r, eps)
-    t = x * (L ** gamma) / (L + eta)
+    t = scale * x * (L ** gamma) / (L + eta)
     peak = t.max(dim=0, keepdim=True).values.clamp_min(1.0)
     return (t / peak).clamp(0, 1)
+
+
+def white_patch_mean(images, r: int = 16, p_white: float = 0.99, display_gamma: float = 2.2,
+                     emit_thr: float = 0.5) -> float:
+    """Scene brightness from white-patch Retinex (Land): in linear light, the scene's p_white percentile of the
+    smooth illumination (guided filter, pooled over ALL given views; pixels brighter than ``emit_thr`` in the dark
+    image, i.e. light sources, excluded) maps to white; no tone curve.  Returns the
+    mean display brightness of that rendering, averaged over the views.  Uses only the given (training) images."""
+    with torch.no_grad():
+        bases, details = [], []
+        for im in images:
+            lin = im.float().clamp(1e-6, 1) ** display_gamma
+            eps = max(4.0 * noise_sigma(lin) ** 2, 1e-8)
+            b = guided_filter_self(lin, r, eps).clamp_min(1e-6)
+            bases.append(b); details.append(lin / b)
+        # robust: pixels already bright in the DARK photo (light sources and their halos) are not "white surfaces"
+        lum = lambda t: 0.299 * t[0] + 0.587 * t[1] + 0.114 * t[2]
+        y = torch.cat([lum(b)[lum(im.float()) <= emit_thr] for b, im in zip(bases, images)])
+        if y.numel() == 0:
+            y = torch.cat([lum(b).flatten() for b in bases])
+        if y.numel() > 2_000_000:
+            y = y[torch.randperm(y.numel(), device=y.device)[:2_000_000]]
+        k = 1.0 / float(torch.quantile(y, p_white).clamp_min(1e-8))
+        ms = []
+        for b, d in zip(bases, details):
+            t = ((b * k).clamp(0, 1) * d).clamp_min(0) ** (1 / display_gamma)
+            ms.append(float((t / t.max(dim=0, keepdim=True).values.clamp_min(1.0)).clamp(0, 1).mean()))
+    return sum(ms) / len(ms)
+
+
+def exposure_factor_for_mean(raws, target_mean: float, lo: float = 0.1, hi: float = 4.0, iters: int = 30) -> float:
+    """One scene-level exposure factor c so that mean over views of hue-safe-clip(c * raw) equals target_mean.
+    ``raws`` are unclipped targets x * L**gamma / (L + eta).  Changes brightness only; gamma (contrast) is kept."""
+    def clip(t):
+        return (t / t.max(dim=0, keepdim=True).values.clamp_min(1.0)).clamp(0, 1)
+    with torch.no_grad():
+        for _ in range(iters):
+            mid = 0.5 * (lo + hi)
+            m = sum(float(clip(mid * r).mean()) for r in raws) / len(raws)
+            lo, hi = (mid, hi) if m < target_mean else (lo, mid)
+    return 0.5 * (lo + hi)
+
+
+def pearson_depth_loss(rendered: torch.Tensor, mono: torch.Tensor) -> torch.Tensor:
+    """1 - Pearson correlation between the rendered inverse depth and a monocular (relative) inverse-depth
+    map.  Scale- and shift-invariant, so the monocular network's unknown scale does not matter
+    (as in LL-Gaussian / DNGaussian-style depth regularisation)."""
+    r = rendered.reshape(-1).float()
+    m = mono.reshape(-1).to(r)
+    r = r - r.mean(); m = m - m.mean()
+    return 1 - (r * m).sum() / (r.norm() * m.norm()).clamp_min(1e-8)
+
+
+class MonoDepth:
+    """Monocular depth for the training views, computed ONCE from the bright targets (never from references).
+
+    ``model`` = a Hugging Face depth-estimation model (default Depth Anything V2 Small, pretrained on normal
+    photos) or "fake" (luminance-based stand-in for offline tests).  Output: relative inverse depth (H,W)."""
+
+    def __init__(self, model: str = "depth-anything/Depth-Anything-V2-Small-hf", device: str = "cuda"):
+        self.model_name, self.device, self.pipe = model, device, None
+
+    def __call__(self, img: torch.Tensor) -> torch.Tensor:
+        H, W = img.shape[-2:]
+        if self.model_name == "fake":
+            y = img.mean(0, keepdim=True)[None]
+            return torch.nn.functional.avg_pool2d(y, 5, 1, 2)[0, 0]
+        if self.pipe is None:
+            from transformers import pipeline
+            self.pipe = pipeline("depth-estimation", model=self.model_name,
+                                 device=0 if str(self.device).startswith("cuda") else -1)
+        from PIL import Image
+        import numpy as np
+        pil = Image.fromarray((img.clamp(0, 1).permute(1, 2, 0).cpu().numpy() * 255).astype("uint8"))
+        d = self.pipe(pil)["predicted_depth"]
+        d = torch.as_tensor(np.asarray(d), dtype=torch.float32)
+        d = d.squeeze()[None, None]
+        return torch.nn.functional.interpolate(d, size=(H, W), mode="bilinear", align_corners=False)[0, 0]
+
+    def free(self):
+        self.pipe = None
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 
 def gaussian_pixel_coords(pc, cam) -> torch.Tensor:
@@ -570,7 +654,7 @@ def render_litalite(render_fn, cam, pc, pipe, bg_color: torch.Tensor, halo: Opti
     b = render_fn(cam, pc, pipe, bg_color, override_color=b_col, **kw)
     d = render_fn(cam, pc, pipe, bg_color, override_color=refl * pc.get_illum, **kw)
     bright, dark = b["render"], d["render"]
-    out = {"bright": bright, "scene": dark,
+    out = {"bright": bright, "scene": dark, "depth": b.get("depth"),
            "viewspace_points": b["viewspace_points"], "visibility_filter": b["visibility_filter"], "radii": b["radii"],
            "dense": [(b["viewspace_points"], b["visibility_filter"], b["radii"]),
                      (d["viewspace_points"], d["visibility_filter"], d["radii"])]}

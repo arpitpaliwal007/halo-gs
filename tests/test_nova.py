@@ -54,3 +54,31 @@ def test_reinhard_key_scale_invariant_and_ordering():
     assert k3 < k1                                                         # mostly-dark high-contrast -> lower key
     dd, _, _ = reinhard_key(dark_hc)
     assert 0.25 <= dd <= 0.6
+
+
+def test_whitepatch_exposure_factor_hits_mean_and_keeps_shape():
+    from halogs.litalite import white_patch_mean, exposure_factor_for_mean, nova_target
+    torch.manual_seed(0)
+    srcs = [(torch.rand(3, 48, 64) * 0.06).clamp(0, 1) for _ in range(3)]
+    m = white_patch_mean(srcs, r=4)
+    assert 0.0 < m < 1.0
+    raws = [nova_target(im, 0.4 / float(im.mean()), 0.72, r=4, scale=1.0) for im in srcs]   # already clipped <= 1
+    c = exposure_factor_for_mean(raws, 0.3)
+    got = sum(float((c * r).clamp(0, 1).mean()) for r in raws) / 3
+    assert abs(got - 0.3) < 0.01
+    a = nova_target(srcs[0], 10.0, 0.72, r=4, scale=0.5); b = nova_target(srcs[0], 10.0, 0.72, r=4, scale=1.0)
+    assert float(a.mean()) < float(b.mean())
+
+
+def test_pearson_depth_and_robust_whitepatch():
+    from halogs.litalite import pearson_depth_loss, white_patch_mean
+    torch.manual_seed(0)
+    d = torch.rand(1, 16, 16)
+    assert float(pearson_depth_loss(d, 3 * d[0] + 2)) < 1e-5            # scale/shift invariant
+    assert float(pearson_depth_loss(d, -d[0])) > 1.9
+    r = torch.rand(1, 16, 16, requires_grad=True); pearson_depth_loss(r, d[0]).backward(); assert r.grad is not None
+    base = [(torch.rand(3, 48, 64) * 0.06).clamp(0, 1) for _ in range(3)]
+    lamp = [b.clone() for b in base]
+    for b in lamp: b[:, :6, :6] = 0.98                                  # a light source in the dark photo
+    m0, m1 = white_patch_mean(base, r=4), white_patch_mean(lamp, r=4)
+    assert abs(m0 - m1) < 0.05                                           # the lamp does not change the white point much

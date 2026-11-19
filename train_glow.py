@@ -43,7 +43,7 @@ from utils.general_utils import safe_state  # noqa: E402
 
 from halogs.gaussians import EmissiveGaussianModel  # noqa: E402
 from halogs.halo import HaloModel, focal_px_from_camera, render_halo  # noqa: E402
-from halogs.litalite import Relight3D, fit_relight_gamma, illum_knn_smooth, illum_white_point, white_patch_loss, reinhard_key, guided_filter_self, noise_sigma, nova_maps, nova_gamma, nova_target, sh_noise_penalty, apply_luma_curve, he_curve, illum_prior_loss, relative_photometric_loss, spatial_consistency_loss, ColourCurveCamera, ToneCurve, bilateral, colour_constancy_loss, exposure_loss, pseudo_weight, brighten_target, grayworld_gains, illum_init_from, render_litalite, scene_gain  # noqa: E402
+from halogs.litalite import MonoDepth, pearson_depth_loss, exposure_factor_for_mean, white_patch_mean, Relight3D, fit_relight_gamma, illum_knn_smooth, illum_white_point, white_patch_loss, reinhard_key, guided_filter_self, noise_sigma, nova_maps, nova_gamma, nova_target, sh_noise_penalty, apply_luma_curve, he_curve, illum_prior_loss, relative_photometric_loss, spatial_consistency_loss, ColourCurveCamera, ToneCurve, bilateral, colour_constancy_loss, exposure_loss, pseudo_weight, brighten_target, grayworld_gains, illum_init_from, render_litalite, scene_gain  # noqa: E402
 from halogs.losses import emission_sparsity, glow_tv, photometric_loss  # noqa: E402
 from halogs.masks import glow_mask  # noqa: E402
 from halogs.metrics import all_metrics  # noqa: E402
@@ -112,6 +112,10 @@ def add_halo_args(p: argparse.ArgumentParser) -> None:
                         "colour_curve = per-view 3x3 colour matrix + knot curve tied to a global curve")
     g.add_argument("--cam_knots", type=int, default=16)
     g.add_argument("--nova_mean", type=float, default=0.5, help="NOVA-GS target exposure for the gamma binary search")
+    g.add_argument("--w_depth", type=float, default=0.0,
+                   help="Pearson depth loss vs monocular depth of the bright targets (Depth Anything V2 Small)")
+    g.add_argument("--depth_model", default="depth-anything/Depth-Anything-V2-Small-hf",
+                   help="Hugging Face depth-estimation model, or 'fake' for offline tests")
     g.add_argument("--relight3d", action="store_true",
                    help="Idea A: enhanced output = splat(R * T(L)), T = clamp(k L)^gamma on the learned 3D illumination")
     g.add_argument("--relight_from", type=int, default=5000, help="iterations of plain v5 (bright = R) before relighting")
@@ -121,7 +125,7 @@ def add_halo_args(p: argparse.ArgumentParser) -> None:
     g.add_argument("--w_anchor", type=float, default=0.1, help="weight of the 2D pseudo-target once relighting is on")
     g.add_argument("--w_lsmooth", type=float, default=1.0, help="3D kNN smoothness of illumination (relighting phase)")
     g.add_argument("--w_wp", type=float, default=0.1, help="white-patch Retinex on reflectance (relighting phase)")
-    g.add_argument("--nova_mean_rule", choices=["fixed", "reinhard"], default="fixed",
+    g.add_argument("--nova_mean_rule", choices=["fixed", "reinhard", "whitepatch_exposure"], default="fixed",
                    help="reinhard = scene-adaptive target exposure from Reinhard (2002) automatic key estimation "
                         "on the training dark images (replaces --nova_mean)")
     g.add_argument("--nova_radius", type=int, default=16, help="guided-filter radius (16 -> 33x33 window, as NOVA-GS)")
@@ -250,6 +254,7 @@ def main():
         torch.save(he_lut, os.path.join(dataset.model_path, "he_lut.pt"))
 
     nova_g = None
+    nova_scale = 1.0
     noise_cache = {}
     dumped = []
 
@@ -277,9 +282,22 @@ def main():
                 disp, key, f = reinhard_key(srcs)
                 print(f"[litalite] Reinhard key: f={f:.3f} key={key:.4f} -> target mean {disp:.4f} (fixed default was {args.nova_mean})")
                 args.nova_mean = disp
-            del srcs
             nova_g = nova_gamma(maps, args.nova_mean)
-            del maps
+            if args.nova_mean_rule == "whitepatch_exposure":
+                # brightness and contrast kept separate: gamma (contrast) from the mean-0.5 rule above, then ONE
+                # exposure factor for the scene so the mean target brightness equals the white-patch value
+                m_wp = white_patch_mean(srcs, args.nova_radius)
+                raws = []
+                for im, L in zip(srcs, maps):
+                    x = (im * _gain(im)).clamp(0, 1)
+                    raws.append(x * L ** nova_g / (L + 1e-3))
+                nova_scale = exposure_factor_for_mean(raws, m_wp)
+                del raws
+                print(f"[litalite] white-patch exposure: scene mean {m_wp:.4f} -> exposure factor {nova_scale:.4f} "
+                      f"(contrast gamma {nova_g:.4f} unchanged)")
+                with open(os.path.join(dataset.model_path, "nova_scale.txt"), "w") as f:
+                    f.write(f"{nova_scale}\n{m_wp}\n")
+            del srcs, maps
         print(f"[litalite] NOVA-GS target: exposure-normalised (theta {args.theta}), guided filter r={args.nova_radius}, "
               f"gamma by binary search to mean {args.nova_mean} -> gamma = {nova_g:.4f}")
         with open(os.path.join(dataset.model_path, "nova_gamma.txt"), "w") as f:
@@ -294,7 +312,7 @@ def main():
                 src = (n2n_apply(n2n_net, (gt * n2n_s).clamp(0, 1)) / n2n_s).clamp(0, 1)
             if nova_g is not None:
                 with torch.no_grad():
-                    t = nova_target(src, _gain(src), nova_g, args.nova_radius)
+                    t = nova_target(src, _gain(src), nova_g, args.nova_radius, scale=nova_scale)
                     if args.w_sh_noise > 0:
                         t_raw = nova_target(gt, _gain(src), nova_g, args.nova_radius)
                         if n2n_net is not None and args.sh_noise_src == "denoiser":
@@ -373,6 +391,15 @@ def main():
     ema_loss = 0.0
     t0 = time.time()
     last_t = t0
+    mono_cache = {}
+    if lit and args.w_depth > 0:   # monocular depth of every training view, from its bright TARGET (no references)
+        md = MonoDepth(args.depth_model, device)
+        with torch.no_grad():
+            for c in train_cams:
+                mono_cache[c.image_name] = md(lit_target(c, c.original_image.to(device))).to(device)
+        md.free()
+        print(f"[litalite] monocular depth ({args.depth_model}) for {len(mono_cache)} training views")
+
     relight = None
     for iteration in range(1, opt.iterations + 1):
         gaussians.update_learning_rate(iteration)
@@ -418,6 +445,8 @@ def main():
                                                                  pkg["visibility_filter"])
             if args.w_ill > 0:
                 loss = loss + args.w_ill * illum_prior_loss(pkg["illum_map"], gt, target, args.ill_smooth)
+            if args.w_depth > 0 and pkg.get("depth") is not None and cam.image_name in mono_cache:
+                loss = loss + args.w_depth * pearson_depth_loss(pkg["depth"], mono_cache[cam.image_name])
             if relit:
                 if args.w_lsmooth > 0:
                     loss = loss + args.w_lsmooth * illum_knn_smooth(gaussians)
